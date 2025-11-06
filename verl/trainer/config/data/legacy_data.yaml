@@ -110,3 +110,15 @@ datagen:
 
 # Additional kwargs when calling tokenizer.apply_chat_template
 apply_chat_template_kwargs: {}
+
+# Curriculum learning parameters (optional, used by custom datasets like OmniMathCurriculumDataset)
+curriculum:
+
+  # Minimum percentage of solution to include in prompt
+  min_percentage: null
+
+  # Maximum percentage of solution to include in prompt
+  max_percentage: null
+
+  # Base seed for reproducible curriculum randomization
+  base_seed: null

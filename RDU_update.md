@@ -18,8 +18,11 @@ examples/
     │   └── omnimath_curriculum_grpo.yaml   [NEW] - Config
     └── run_omnimath_curriculum.sh          [NEW] - Training script
 
-verl/trainer/ppo/
-└── ray_trainer.py                          [MODIFIED] - Lines 1141-1167
+verl/trainer/
+├── ppo/
+│   └── ray_trainer.py                      [MODIFIED] - Lines 1141-1167
+└── config/data/
+    └── legacy_data.yaml                    [MODIFIED] - Lines 114-124
 ```
 
 ## New Files
@@ -55,7 +58,34 @@ verl/trainer/ppo/
 
 ## Modified Files
 
-### `verl/trainer/ppo/ray_trainer.py`
+### 1. `verl/trainer/config/data/legacy_data.yaml`
+
+**Lines 114-124**: Added curriculum learning configuration structure
+
+**Purpose**: Enable curriculum parameters to be passed via command-line or config files without Hydra struct mode errors
+
+**Added fields**:
+```yaml
+# Curriculum learning parameters (optional, used by custom datasets like OmniMathCurriculumDataset)
+curriculum:
+
+  # Minimum percentage of solution to include in prompt
+  min_percentage: null
+
+  # Maximum percentage of solution to include in prompt
+  max_percentage: null
+
+  # Base seed for reproducible curriculum randomization
+  base_seed: null
+```
+
+**Why needed**:
+- The trainer sets `OmegaConf.set_struct(config, True)` at `ray_trainer.py:409`
+- Struct mode prevents adding new keys that don't exist in base config
+- Adding `curriculum` to base config allows override via CLI: `data.curriculum.min_percentage=0.0`
+- Values default to `null` so they're optional for non-curriculum experiments
+
+### 2. `verl/trainer/ppo/ray_trainer.py`
 
 Two modifications to the `RayPPOTrainer` class:
 
