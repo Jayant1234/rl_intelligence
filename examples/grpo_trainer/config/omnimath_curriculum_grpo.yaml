@@ -1,0 +1,230 @@
+# Copyright 2024 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# OmniMath Curriculum Learning Configuration for GRPO
+# This config ties together:
+# 1. Custom dataset with dynamic curriculum (omnimath_curriculum_dataset.py)
+# 2. Custom metrics computation from models (omnimath_curriculum_metrics.py)
+# 3. Custom reward function (omnimath_reward.py)
+
+defaults:
+  - actor@actor_rollout_ref.actor: dp_actor
+  - data@data: legacy_data
+  - ref@actor_rollout_ref.ref: dp_ref
+  - rollout@actor_rollout_ref.rollout: rollout
+  - model@actor_rollout_ref.model: hf_model
+  - _self_
+
+# Data configuration
+data:
+
+  # Path to preprocessed OmniMath parquet files
+  train_files: ~/data/omnimath/train.parquet
+
+  # Validation files
+  val_files: ~/data/omnimath/val.parquet
+
+  # Batch size for training
+  train_batch_size: 512
+
+  # Batch size for validation
+  val_batch_size: 512
+
+  # Maximum prompt length
+  max_prompt_length: 2048
+
+  # Maximum response length (OmniMath solutions can be long)
+  max_response_length: 2048
+
+  # Filter prompts that exceed max_prompt_length
+  filter_overlong_prompts: True
+
+  # Truncation mode: "error" will raise error if prompt is too long
+  truncation: error
+
+  # Custom dataset class configuration
+  custom_cls:
+
+    # Path to custom dataset implementation
+    path: examples/data_preprocess/omnimath_curriculum_dataset.py
+
+    # Class name
+    name: OmniMathCurriculumDataset
+
+  # Curriculum learning parameters (used by custom dataset)
+  curriculum:
+
+    # Minimum percentage of solution to include in prompt (0%)
+    min_percentage: 0.0
+
+    # Maximum percentage of solution to include in prompt (80%)
+    max_percentage: 0.8
+
+    # Base seed for reproducible curriculum randomization
+    base_seed: 42
+
+# Custom curriculum metrics computation
+# This is called AFTER policy and reference models compute log probs
+# Results are injected into batch.non_tensor_batch for reward function
+custom_curriculum_metrics:
+
+  # Path to metrics computation function
+  path: examples/reward_functions/omnimath_curriculum_metrics.py
+
+  # Function name
+  name: compute_omnimath_curriculum_metrics
+
+# Custom reward function configuration
+custom_reward_function:
+
+  # Path to reward function
+  path: examples/reward_functions/omnimath_reward.py
+
+  # Function name
+  name: compute_score
+
+# Actor, rollout, and reference model configuration
+actor_rollout_ref:
+
+  # Hybrid engine mode
+  hybrid_engine: true
+
+  # Model configuration
+  model:
+
+    # Model path (change to your model)
+    path: Qwen/Qwen2.5-7B-Instruct
+
+    # Enable gradient checkpointing to save memory
+    enable_gradient_checkpointing: True
+
+    # Use remove padding optimization
+    use_remove_padding: True
+
+  # Actor (policy model being trained) configuration
+  actor:
+
+    # Optimizer learning rate
+    optim:
+      lr: 1e-6
+
+    # PPO batch sizes
+    ppo_mini_batch_size: 128
+    ppo_micro_batch_size_per_gpu: 8
+
+    # KL loss (in addition to reward-based KL penalty)
+    use_kl_loss: True
+    kl_loss_coef: 0.001
+    kl_loss_type: low_var_kl
+
+    # No entropy regularization
+    entropy_coeff: 0
+
+    # FSDP configuration
+    fsdp_config:
+      param_offload: False
+      optimizer_offload: False
+
+  # Rollout (generation) configuration
+  rollout:
+
+    # Rollout engine: vllm or sglang
+    name: vllm
+
+    # Tensor parallel size for rollout
+    tensor_model_parallel_size: 2
+
+    # GPU memory utilization
+    gpu_memory_utilization: 0.6
+
+    # Number of samples per prompt (for GRPO group advantage)
+    n: 5
+
+    # Batch size for log prob computation
+    log_prob_micro_batch_size_per_gpu: 8
+
+  # Reference model configuration (frozen copy for KL divergence)
+  ref:
+
+    # Batch size for reference log prob computation
+    log_prob_micro_batch_size_per_gpu: 8
+
+    # Offload reference model to save memory
+    fsdp_config:
+      param_offload: True
+
+# Algorithm configuration
+algorithm:
+
+  # Use GRPO advantage estimator
+  adv_estimator: grpo
+
+  # Normalize advantages by std (GRPO-specific)
+  norm_adv_by_std_in_grpo: True
+
+  # Do NOT use in-reward KL penalty (already applied in GRPO)
+  use_kl_in_reward: False
+
+  # KL penalty type
+  kl_penalty: kl
+
+  # KL control
+  kl_ctrl:
+    type: fixed
+    kl_coef: 0.001
+
+  # Discount factor
+  gamma: 1.0
+
+  # Lambda for GAE (not used in GRPO but required)
+  lam: 1.0
+
+# Trainer configuration
+trainer:
+
+  # Total training epochs
+  total_epochs: 20
+
+  # Project name for logging
+  project_name: verl_omnimath_curriculum
+
+  # Experiment name
+  experiment_name: qwen2.5_7b_grpo_curriculum
+
+  # Logging backends
+  logger: ["console", "wandb"]
+
+  # Number of GPUs per node
+  n_gpus_per_node: 8
+
+  # Number of nodes
+  nnodes: 1
+
+  # Checkpoint save frequency (iterations)
+  save_freq: 10
+
+  # Validation frequency (iterations)
+  test_freq: 5
+
+  # Run validation before training
+  val_before_train: True
+
+  # Critic warmup (not used in GRPO)
+  critic_warmup: 0
+
+  # Resume mode
+  resume_mode: auto
+
+  # Default local checkpoint directory
+  default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}

@@ -516,6 +516,91 @@ class RayPPOTrainer:
 
         return gen_batch
 
+    def _construct_empty_cot_batch(self, batch: DataProto) -> DataProto:
+        """
+        Reconstruct batch with prompt only (no CoT), keeping same answer tokens.
+
+        For Information Gain calculation:
+        IG = log P(answer | prompt + CoT) - log P(answer | prompt)
+
+        Args:
+            batch: Original batch with CoT in prompts
+
+        Returns:
+            DataProto with empty CoT (prompt only) but same responses
+        """
+        import torch
+        from verl import DataProto
+        import verl.utils.torch_functional as verl_F
+        from verl.utils.model import compute_position_id_with_mask
+
+        batch_size = len(batch)
+        responses = batch.batch["responses"]  # [B, R]
+
+        new_input_ids = []
+        new_attention_mask = []
+        new_position_ids = []
+
+        for i in range(batch_size):
+            # Get question text (no CoT)
+            problem = batch.non_tensor_batch["extra_info"][i]["problem"]
+
+            # Create prompt without CoT (empty partial solution)
+            from examples.data_preprocess.omnimath_curriculum_dataset import create_curriculum_prompt
+            prompt_text = create_curriculum_prompt(problem, "")
+
+            # Apply chat template
+            raw_prompt = self.tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt_text}],
+                add_generation_prompt=True,
+                tokenize=False
+            )
+
+            # Tokenize prompt
+            prompt_encoding = self.tokenizer(raw_prompt, add_special_tokens=False, return_tensors="pt")
+            prompt_ids = prompt_encoding["input_ids"][0]  # [P]
+
+            # Get answer tokens (remove padding)
+            answer_ids = responses[i]  # [R]
+            valid_answer_len = batch.batch["response_mask"][i].sum().item()
+            answer_ids = answer_ids[:valid_answer_len]  # [R']
+
+            # Concatenate: prompt + answer (no CoT)
+            full_ids = torch.cat([prompt_ids, answer_ids])  # [P + R']
+
+            # Create masks
+            full_mask = torch.ones_like(full_ids)
+
+            # Pad to original max length
+            max_len = batch.batch["input_ids"].shape[1]
+            full_ids_padded, full_mask_padded = verl_F.postprocess_data(
+                input_ids=full_ids.unsqueeze(0),
+                attention_mask=full_mask.unsqueeze(0),
+                max_length=max_len,
+                pad_token_id=self.tokenizer.pad_token_id,
+                left_pad=True,
+                truncation="error"
+            )
+
+            pos_ids = compute_position_id_with_mask(full_mask_padded)
+
+            new_input_ids.append(full_ids_padded[0])
+            new_attention_mask.append(full_mask_padded[0])
+            new_position_ids.append(pos_ids[0])
+
+        # Create new batch
+        empty_cot_dict = {
+            "input_ids": torch.stack(new_input_ids),         # [B, S]
+            "attention_mask": torch.stack(new_attention_mask), # [B, S]
+            "position_ids": torch.stack(new_position_ids),    # [B, S]
+            "responses": batch.batch["responses"],            # [B, R] - same
+        }
+
+        empty_cot_batch = DataProto.from_single_dict(empty_cot_dict)
+        empty_cot_batch.meta_info = batch.meta_info.copy()
+
+        return empty_cot_batch
+
     def _validate(self):
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
@@ -1137,6 +1222,39 @@ class RayPPOTrainer:
                             else:
                                 ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
+
+                    # ===== COMPUTE INFORMATION GAIN WITH EMPTY CoT BASELINE =====
+                    if self.config.get("compute_information_gain", False):
+                        with marked_timer("information_gain", timing_raw, color="purple"):
+                            # Step 1: Current log probs (with CoT) already in batch
+                            log_probs_with_cot = batch.batch["old_log_probs"]  # [B, R]
+
+                            # Step 2: Construct empty CoT batch
+                            empty_cot_batch = self._construct_empty_cot_batch(batch)
+
+                            # Step 3: Compute log probs without CoT
+                            empty_log_prob = self.actor_rollout_wg.compute_log_prob(empty_cot_batch)
+                            log_probs_without_cot = empty_log_prob.batch["old_log_probs"]  # [B, R]
+
+                            # Step 4: Calculate Information Gain per sample
+                            response_masks = batch.batch["response_mask"]  # [B, R]
+
+                            # Sum log probs over valid tokens
+                            sum_with_cot = (log_probs_with_cot * response_masks).sum(dim=1)      # [B]
+                            sum_without_cot = (log_probs_without_cot * response_masks).sum(dim=1) # [B]
+
+                            information_gain = sum_with_cot - sum_without_cot  # [B]
+
+                            # Store in batch for reward function
+                            batch.batch["information_gain"] = information_gain  # [B]
+
+                            # Log metrics
+                            ig_metrics = {
+                                "curriculum/information_gain_mean": information_gain.mean().item(),
+                                "curriculum/information_gain_std": information_gain.std().item(),
+                            }
+                            metrics.update(ig_metrics)
+                    # ===== END INFORMATION GAIN =====
 
                     # compute values
                     if self.use_critic:
