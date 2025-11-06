@@ -21,8 +21,10 @@ examples/
 verl/trainer/
 ├── ppo/
 │   └── ray_trainer.py                      [MODIFIED] - Lines 1141-1167
-└── config/data/
-    └── legacy_data.yaml                    [MODIFIED] - Lines 114-124
+└── config/
+    ├── ppo_trainer.yaml                    [MODIFIED] - Lines 62-64
+    └── data/
+        └── legacy_data.yaml                [MODIFIED] - Lines 114-124
 ```
 
 ## New Files

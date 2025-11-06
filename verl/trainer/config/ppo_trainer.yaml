@@ -59,6 +59,10 @@ custom_reward_function:
   # The name of the reward function within the specified file. Default is 'compute_score'.
   name: compute_score
 
+# Whether to compute information gain for curriculum learning
+# Information gain measures: IG = log P(answer | prompt + CoT) - log P(answer | prompt)
+compute_information_gain: False
+
 # config for the algorithm
 algorithm:
 
