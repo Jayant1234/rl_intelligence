@@ -13,31 +13,39 @@
 # limitations under the License.
 
 """
-OmniMath curriculum learning reward function.
+OmniMath curriculum learning reward function with Information Gain.
 
-This reward function receives custom metrics computed from policy and reference models:
+This reward function uses information gain as the primary reward signal:
+- information_gain: How much the partial solution (CoT) helps the model predict the answer
+  IG = log P(answer | prompt + CoT) - log P(answer | prompt only)
+
+Additional metrics for analysis:
 - policy_confidence: Average token probability from policy model
 - kl_divergence: KL(policy || reference)
-- decoded_responses: Model's generated text
 - partial_solution_given: Solution shown in prompt
 - remaining_solution: Solution model should generate
+- solution_percentage: Percentage of solution given in prompt (0.0 to 0.8)
 """
 
 
 def compute_score(data_source, solution_str, ground_truth, extra_info=None):
     """
-    Compute reward using both text-based and model-based metrics.
+    Compute reward using information gain as the primary signal.
+
+    Information Gain measures how much the Chain-of-Thought reasoning (partial solution)
+    helps the model predict the correct answer. Higher IG = better reasoning.
 
     Args:
-        data_source (str): Dataset identifier
+        data_source (str): Dataset identifier (e.g., 'KbsdJames/Omni-MATH')
         solution_str (str): Model's generated response (decoded text)
         ground_truth (str): Final answer from dataset
-        extra_info (dict): Contains injected custom metrics:
-            - policy_confidence: float, model's average token probability
-            - kl_divergence: float, KL(policy || reference)
-            - decoded_responses: str, same as solution_str
+        extra_info (dict): Contains computed metrics:
+            - information_gain: float, IG = log P(answer|CoT) - log P(answer|no CoT)
+            - policy_confidence: float, model's average token probability (optional)
+            - kl_divergence: float, KL(policy || reference) (optional)
             - partial_solution_given: str, solution in prompt
             - remaining_solution: str, solution model should generate
+            - solution_percentage_actual: float, percentage of solution given (0.0-0.8)
 
     Returns:
         dict with "score" and other metrics for logging
@@ -45,74 +53,76 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None):
 
     if not extra_info:
         # Fallback if no custom metrics
-        return {"score": 0.5, "warning": "No custom metrics available"}
+        return {"score": 0.0, "warning": "No extra_info available"}
 
-    # ===== EXTRACT INJECTED METRICS =====
-    policy_confidence = extra_info.get("policy_confidence", 0.5)
-    kl_divergence = extra_info.get("kl_divergence", 0.0)
+    # ===== EXTRACT METRICS =====
+    information_gain = extra_info.get("information_gain", None)
+    policy_confidence = extra_info.get("policy_confidence", None)
+    kl_divergence = extra_info.get("kl_divergence", None)
     partial_given = extra_info.get("partial_solution_given", "")
     remaining_sol = extra_info.get("remaining_solution", "")
     solution_percentage = extra_info.get("solution_percentage_actual", 0.0)
 
-    # ===== PSEUDOCODE REWARD CALCULATION =====
-    # TODO: Implement your actual logic here!
+    # Check if information gain is available
+    if information_gain is None:
+        # Fallback: IG not computed (compute_information_gain=False in config)
+        return {
+            "score": 0.0,
+            "warning": "information_gain not found in extra_info. Set compute_information_gain=True"
+        }
 
-    # 1. TEXT-BASED: Check if model continued correctly
-    # For now: simple substring check (you should use better similarity)
-    if remaining_sol:
-        # Simple check: does response contain keywords from remaining solution?
-        remaining_words = set(remaining_sol.lower().split())
-        response_words = set(solution_str.lower().split())
-        overlap = len(remaining_words & response_words) / max(len(remaining_words), 1)
-        continuation_score = min(overlap * 2.0, 1.0)  # Scale to [0, 1]
-    else:
-        # No remaining solution (100% was given)
-        continuation_score = 1.0
+    # ===== INFORMATION GAIN BASED REWARD CALCULATION =====
 
-    # 2. MODEL-BASED: Use policy confidence
-    # High confidence + correct = bonus
-    # High confidence + wrong = penalty
-    if continuation_score > 0.7:
-        # Correct continuation
-        if policy_confidence > 0.6:
-            confidence_bonus = 1.2  # Confident AND correct
-        else:
-            confidence_bonus = 1.0  # Uncertain but correct
-    else:
-        # Wrong continuation
-        if policy_confidence > 0.7:
-            confidence_bonus = 0.5  # Overconfident but wrong - penalty
-        else:
-            confidence_bonus = 0.8  # Uncertain and wrong - small penalty
+    # STRATEGY: Use Information Gain as primary reward signal
+    # IG = log P(answer | prompt + CoT) - log P(answer | prompt only)
+    #
+    # Interpretation:
+    # - IG > 0: CoT helps the model (reasoning is useful)
+    # - IG = 0: CoT provides no information
+    # - IG < 0: CoT confuses the model (bad reasoning)
+    #
+    # Goal: Maximize information gain = encourage useful reasoning
 
-    base_reward = continuation_score * confidence_bonus
+    # 1. BASE REWARD: Use Information Gain directly
+    # Scale IG to a reasonable reward range
+    # Typical IG values might be in range [-10, 10], but can vary
+    base_reward = information_gain
 
-    # 3. CURRICULUM: Harder curriculum (less help) = higher multiplier
-    # When solution_percentage is low (less help given), reward success more
-    curriculum_multiplier = 1.0 + (1.0 - solution_percentage)
+    # 2. CURRICULUM MULTIPLIER: Reward harder problems more
+    # When solution_percentage is low (less help given), the task is harder
+    # Give higher reward for achieving high IG on harder problems
+    curriculum_multiplier = 1.0 + (1.0 - solution_percentage) * 0.5
+    # Examples:
+    # - solution_percentage = 0.0 (no help): multiplier = 1.5
+    # - solution_percentage = 0.4 (40% help): multiplier = 1.3
+    # - solution_percentage = 0.8 (80% help): multiplier = 1.1
 
-    # 4. EXPLORATION BONUS: Reward exploration on hard problems
-    # High KL = policy is exploring
-    if solution_percentage < 0.3:  # Hard curriculum (little help)
-        if kl_divergence > 5.0 and continuation_score > 0.7:
-            # Exploring AND correct on hard problem = bonus
-            curriculum_multiplier *= 1.3
-
-    # 5. FINAL REWARD
+    # 3. APPLY CURRICULUM SCALING
     final_reward = base_reward * curriculum_multiplier
 
-    # Clip to reasonable range
-    final_reward = max(0.0, min(final_reward, 2.0))
+    # 4. OPTIONAL: Add bonus for very high IG (exceptional reasoning)
+    if information_gain > 5.0:
+        # Very high IG = model is learning strong reasoning patterns
+        final_reward *= 1.2
 
-    # Return detailed dict for logging
+    # 5. OPTIONAL: Penalize negative IG more on easy problems
+    # If we gave lots of help but model still has negative IG, penalize more
+    if information_gain < 0 and solution_percentage > 0.5:
+        final_reward *= 1.5  # Make negative reward worse
+
+    # Note: We don't clip the reward because IG can naturally be negative
+    # Negative rewards are informative - they tell the model its reasoning was harmful
+
+    # Return detailed dict for logging and analysis
     return {
         "score": float(final_reward),
-        "continuation_score": float(continuation_score),
-        "policy_confidence": float(policy_confidence),
-        "kl_divergence": float(kl_divergence),
-        "confidence_bonus": float(confidence_bonus),
+        "information_gain": float(information_gain),
+        "base_reward": float(base_reward),
         "curriculum_multiplier": float(curriculum_multiplier),
         "solution_percentage": float(solution_percentage),
         "partial_given_len": len(partial_given),
         "remaining_sol_len": len(remaining_sol),
+        # Optional metrics (may be None if not computed)
+        "policy_confidence": float(policy_confidence) if policy_confidence is not None else None,
+        "kl_divergence": float(kl_divergence) if kl_divergence is not None else None,
     }

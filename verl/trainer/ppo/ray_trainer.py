@@ -1183,19 +1183,6 @@ class RayPPOTrainer:
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
-                    with marked_timer("reward", timing_raw, color="yellow"):
-                        # compute reward model score
-                        if self.use_rm and "rm_scores" not in batch.batch.keys():
-                            reward_tensor = self.rm_wg.compute_rm_score(batch)
-                            batch = batch.union(reward_tensor)
-
-                        if self.config.reward_model.launch_reward_fn_async:
-                            future_reward = compute_reward_async.remote(
-                                data=batch, config=self.config, tokenizer=self.tokenizer
-                            )
-                        else:
-                            reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
-
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
@@ -1248,6 +1235,22 @@ class RayPPOTrainer:
                             # Store in batch for reward function
                             batch.batch["information_gain"] = information_gain  # [B]
 
+                            # CRITICAL FIX: Inject information gain into non_tensor_batch so reward function can access it
+                            # Convert tensor to numpy and add to each sample's extra_info
+                            ig_numpy = information_gain.cpu().numpy()
+                            for i in range(len(batch)):
+                                # Initialize extra_info if it doesn't exist
+                                if "extra_info" not in batch.non_tensor_batch:
+                                    batch.non_tensor_batch["extra_info"] = [{} for _ in range(len(batch))]
+                                elif not isinstance(batch.non_tensor_batch["extra_info"], list):
+                                    # Convert to list if it's numpy array
+                                    batch.non_tensor_batch["extra_info"] = list(batch.non_tensor_batch["extra_info"])
+
+                                # Inject information gain value for this sample
+                                if not isinstance(batch.non_tensor_batch["extra_info"][i], dict):
+                                    batch.non_tensor_batch["extra_info"][i] = {}
+                                batch.non_tensor_batch["extra_info"][i]["information_gain"] = float(ig_numpy[i])
+
                             # Log metrics
                             ig_metrics = {
                                 "curriculum/information_gain_mean": information_gain.mean().item(),
@@ -1255,6 +1258,21 @@ class RayPPOTrainer:
                             }
                             metrics.update(ig_metrics)
                     # ===== END INFORMATION GAIN =====
+
+                    # ===== COMPUTE REWARD =====
+                    # Reward computation moved here (after information gain) so reward function can access IG
+                    with marked_timer("reward", timing_raw, color="yellow"):
+                        # compute reward model score
+                        if self.use_rm and "rm_scores" not in batch.batch.keys():
+                            reward_tensor = self.rm_wg.compute_rm_score(batch)
+                            batch = batch.union(reward_tensor)
+
+                        if self.config.reward_model.launch_reward_fn_async:
+                            future_reward = compute_reward_async.remote(
+                                data=batch, config=self.config, tokenizer=self.tokenizer
+                            )
+                        else:
+                            reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
 
                     # compute values
                     if self.use_critic:
