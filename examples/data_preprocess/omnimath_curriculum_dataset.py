@@ -140,16 +140,42 @@ def create_curriculum_prompt(problem: str, given_solution: str) -> str:
     Returns:
         Formatted prompt string
     """
-    instruction = (
-        "Solve this problem step by step. Show your reasoning clearly. "
-        "If a partial solution is provided, continue from where it left off and complete the solution. "
-        "Put your final answer in \\boxed{}."
-    )
-
     if given_solution.strip():
-        prompt = f"{problem}\n\n{instruction}\n\nPartial solution:\n{given_solution}\n\nPlease continue and complete the solution:"
+        # With partial solution: ask for reasoning first, then completion
+        prompt = (
+            f"{problem}\n\n"
+            f"A partial solution is provided below:\n\n"
+            f"{given_solution}\n\n"
+            f"Task: Complete this solution by following these steps in order.\n\n"
+            f"First, write your reasoning:\n"
+            f"- Explain what the partial solution has established\n"
+            f"- Identify what steps remain to be done\n\n"
+            f"Then, complete the remaining solution:\n"
+            f"- Show the remaining steps clearly\n"
+            f"- Put your final answer in \\boxed{{}}\n\n"
+            f"Format your response as:\n\n"
+            f"**Reasoning:**\n"
+            f"[Your understanding of the partial solution and plan for remaining steps]\n\n"
+            f"**Remaining Solution:**\n"
+            f"[Complete the remaining steps and final answer in \\boxed{{}}]"
+        )
     else:
-        prompt = f"{problem}\n\n{instruction}\n\nSolution:"
+        # Without partial solution: ask for reasoning first, then full solution
+        prompt = (
+            f"{problem}\n\n"
+            f"Task: Solve this problem by following these steps in order.\n\n"
+            f"First, write your reasoning:\n"
+            f"- Break down the problem\n"
+            f"- Plan your solution approach\n\n"
+            f"Then, write your complete solution:\n"
+            f"- Show all steps clearly\n"
+            f"- Put your final answer in \\boxed{{}}\n\n"
+            f"Format your response as:\n\n"
+            f"**Reasoning:**\n"
+            f"[Your step-by-step reasoning and approach]\n\n"
+            f"**Solution:**\n"
+            f"[Complete solution with final answer in \\boxed{{}}]"
+        )
 
     return prompt
 
