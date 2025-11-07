@@ -1,7 +1,18 @@
 # OmniMath Curriculum Learning - Changes Summary
 
 ## Overview
-Implemented curriculum learning for OmniMath with GRPO, allowing 0-80% of solution to be randomly included in prompts with per-epoch re-randomization. Custom reward uses policy + reference model metrics.
+Implemented curriculum learning for OmniMath with GRPO, allowing 0-80% of solution to be randomly included in prompts with per-epoch re-randomization. Custom reward combines Information Gain (reasoning quality) + Format Reward (RLVR-style) to encourage both helpful reasoning and structured outputs.
+
+## Latest Updates (Information Gain Redesign)
+
+**Major Change**: Redesigned Information Gain to measure **reasoning quality** rather than response quality.
+
+**New IG Formula**:
+```
+IG = log P(gold_solution | prompt + reasoning) - log P(gold_solution | prompt)
+```
+
+**Why**: This measures whether the model's generated reasoning helps predict the CORRECT answer, providing a stronger learning signal for reasoning improvement.
 
 ## File Structure
 
@@ -46,9 +57,19 @@ verl/trainer/
 - Returns: `policy_confidence`, `kl_divergence`, `decoded_responses`, `partial_solution_given`, `remaining_solution`
 
 ### 4. `examples/reward_functions/omnimath_reward.py`
-- `compute_score()`: Reward function using injected metrics
-- Combines text-based (continuation quality) + model-based (confidence, KL) signals
-- Applies curriculum scaling (less help = higher reward)
+- `check_format_compliance()`: RLVR-style format checker (lines 39-114)
+  - Checks for **Reasoning:** header
+  - Checks for **Solution:** or **Remaining Solution:** header
+  - Verifies `\boxed{}` answer presence
+  - Validates section order (reasoning before solution)
+  - Checks substantive content (reasoning ≥20 chars, solution ≥10 chars)
+  - Returns total_format_score in [0, 1]
+
+- `compute_score()`: Reward function combining IG + Format Reward (lines 117-241)
+  - **Simple formula**: `final_reward = normalized_IG + (0.3 × format_reward_scaled)`
+  - Uses Information Gain from `extra_info` (injected by ray_trainer)
+  - Applies format reward to encourage structured responses
+  - Returns detailed metrics for logging
 
 ### 5. `examples/grpo_trainer/config/omnimath_curriculum_grpo.yaml`
 - Training configuration linking all components
@@ -89,65 +110,153 @@ curriculum:
 
 ### 2. `verl/trainer/ppo/ray_trainer.py`
 
-Two modifications to the `RayPPOTrainer` class:
+**Major redesign of Information Gain computation**. Three new methods added and IG computation block completely rewritten.
 
 #### **1. Helper Method: `_construct_empty_cot_batch()` (Lines 519-602)**
 
 **Location**: After `_get_gen_batch()` method
 
-**Purpose**: Reconstructs batch with empty CoT (prompt only) for baseline log probability computation
+**Purpose**: *(DEPRECATED - kept for reference but no longer used)* Originally reconstructed batch with empty CoT for baseline
+
+**Status**: Not used by new IG calculation
+
+---
+
+#### **2. NEW Helper Method: `_parse_reasoning_from_response()` (Lines 604-644)**
+
+**Location**: After `_construct_empty_cot_batch()` method
+
+**Purpose**: Parse generated responses to extract reasoning and solution sections
 
 **Key functionality**:
-- Extracts question text from `batch.non_tensor_batch["extra_info"][i]["problem"]`
-- Creates prompt without CoT using `create_curriculum_prompt(problem, "")`
-- Tokenizes and pads to match original batch dimensions
-- Returns DataProto with: prompt + answer (no CoT), keeping same response tokens
-
-#### **2. Information Gain Computation Block (Lines 1226-1257)**
-
-**Location**: After `ref_log_prob` computation (line 1224), before value computation
-
-**Added code**:
 ```python
-# ===== COMPUTE INFORMATION GAIN WITH EMPTY CoT BASELINE =====
+def _parse_reasoning_from_response(self, response_text: str, has_partial_solution: bool) -> tuple[str, str]:
+    """
+    Returns: (reasoning_text, generated_remaining_solution_text)
+    """
+    # Find **Reasoning:** section
+    # Find **Solution:** or **Remaining Solution:** section
+    # Extract text between headers
+    # Return tuple of (reasoning, solution)
+```
+
+**Returns**:
+- `reasoning_text`: Content of **Reasoning:** section
+- `generated_remaining_solution_text`: Content of **Solution:** or **Remaining Solution:** section
+
+---
+
+#### **3. NEW Helper Method: `_construct_ig_batches_with_gold_solution()` (Lines 646-839)**
+
+**Location**: After `_parse_reasoning_from_response()` method
+
+**Purpose**: Construct two batches for new IG formula
+
+**Key functionality**:
+
+For each sample in batch:
+1. **Parse generated response** to extract reasoning
+2. **Get gold solution** from `batch.non_tensor_batch["reward_model"][i]["remaining_solution"]`
+3. **Construct TWO prompts**:
+
+   **Prompt WITH reasoning**:
+   ```
+   problem + partial_solution + **Reasoning:** + model_reasoning + **Remaining Solution:** + gold_solution
+   ```
+
+   **Prompt WITHOUT reasoning**:
+   ```
+   problem + partial_solution + **Remaining Solution:** + gold_solution
+   ```
+
+4. **Tokenize both prompts** and create response masks for gold solution tokens
+5. **Pad to max length** and compute position IDs
+
+**Returns**: `tuple[DataProto, DataProto]`
+- `batch_with_reasoning`: For computing `log P(gold_solution | prompt + reasoning)`
+- `batch_without_reasoning`: For computing `log P(gold_solution | prompt)`
+
+---
+
+#### **4. REDESIGNED Information Gain Computation Block (Lines 1450-1534)**
+
+**Location**: After `ref_log_prob` computation, before reward computation
+
+**Complete rewrite of IG calculation**:
+
+```python
+# ===== COMPUTE INFORMATION GAIN BASED ON REASONING QUALITY =====
+# New IG formula: IG = log P(gold_solution | prompt + reasoning) - log P(gold_solution | prompt)
+# This measures: "Does the model's reasoning help predict the CORRECT answer?"
 if self.config.get("compute_information_gain", False):
     with marked_timer("information_gain", timing_raw, color="purple"):
-        # Step 1: Current log probs (with CoT) already in batch
-        log_probs_with_cot = batch.batch["old_log_probs"]  # [B, R]
+        # Step 1: Construct two batches for IG calculation
+        batch_with_reasoning, batch_without_reasoning = self._construct_ig_batches_with_gold_solution(batch)
 
-        # Step 2: Construct empty CoT batch
-        empty_cot_batch = self._construct_empty_cot_batch(batch)
+        # Step 2: Compute log probs for both batches
+        # Log P(gold_solution | prompt + reasoning)
+        log_prob_with_reasoning = self.actor_rollout_wg.compute_log_prob(batch_with_reasoning)
+        log_probs_with = log_prob_with_reasoning.batch["old_log_probs"]  # [B, R]
+        response_masks_with = batch_with_reasoning.batch["response_mask"]  # [B, R]
 
-        # Step 3: Compute log probs without CoT
-        empty_log_prob = self.actor_rollout_wg.compute_log_prob(empty_cot_batch)
-        log_probs_without_cot = empty_log_prob.batch["old_log_probs"]  # [B, R]
+        # Log P(gold_solution | prompt only)
+        log_prob_without_reasoning = self.actor_rollout_wg.compute_log_prob(batch_without_reasoning)
+        log_probs_without = log_prob_without_reasoning.batch["old_log_probs"]  # [B, R]
+        response_masks_without = batch_without_reasoning.batch["response_mask"]  # [B, R]
 
-        # Step 4: Calculate Information Gain per sample
-        response_masks = batch.batch["response_mask"]  # [B, R]
+        # Step 3: Sum log probs over gold solution tokens
+        sum_with_reasoning = (log_probs_with * response_masks_with).sum(dim=1)  # [B]
+        sum_without_reasoning = (log_probs_without * response_masks_without).sum(dim=1)  # [B]
 
-        # Sum log probs over valid tokens
-        sum_with_cot = (log_probs_with_cot * response_masks).sum(dim=1)      # [B]
-        sum_without_cot = (log_probs_without_cot * response_masks).sum(dim=1) # [B]
+        # Step 4: Calculate Information Gain
+        # IG = log P(gold | prompt + reasoning) - log P(gold | prompt)
+        # Positive IG = reasoning helps predict correct answer
+        # Negative IG = reasoning hurts (confuses model)
+        information_gain_raw = sum_with_reasoning - sum_without_reasoning  # [B]
 
-        information_gain = sum_with_cot - sum_without_cot  # [B]
+        # Step 5: Normalize IG to [-1, 1] using batch statistics
+        ig_std = information_gain_raw.std() + 1e-8
+        ig_mean = information_gain_raw.mean()
+        information_gain_normalized = torch.tanh((information_gain_raw - ig_mean) / (ig_std + 1e-8))
+        information_gain = information_gain_normalized  # [B], range: [-1, 1]
 
-        # Store in batch for reward function
-        batch.batch["information_gain"] = information_gain  # [B]
+        # Step 6: Store both raw and normalized IG
+        batch.batch["information_gain_raw"] = information_gain_raw
+        batch.batch["information_gain"] = information_gain
 
-        # Log metrics
+        # Step 7: Inject into non_tensor_batch for reward function access
+        ig_numpy = information_gain.cpu().numpy()
+        ig_raw_numpy = information_gain_raw.cpu().numpy()
+
+        # [Lines 1500-1518: Code to inject IG into extra_info dict]
+
+        batch.non_tensor_batch["extra_info"] = np.array(extra_info_list, dtype=object)
+
+        # Step 8: Log metrics
         ig_metrics = {
             "curriculum/information_gain_mean": information_gain.mean().item(),
             "curriculum/information_gain_std": information_gain.std().item(),
+            "curriculum/information_gain_min": information_gain.min().item(),
+            "curriculum/information_gain_max": information_gain.max().item(),
+            "curriculum/information_gain_raw_mean": information_gain_raw.mean().item(),
+            "curriculum/information_gain_raw_std": information_gain_raw.std().item(),
+            "curriculum/information_gain_raw_min": information_gain_raw.min().item(),
+            "curriculum/information_gain_raw_max": information_gain_raw.max().item(),
         }
         metrics.update(ig_metrics)
 # ===== END INFORMATION GAIN =====
 ```
 
 **What it does**:
-- Computes Information Gain: `IG = log P(answer | prompt + CoT) - log P(answer | prompt)`
-- Stores result in `batch.batch["information_gain"]` tensor [B]
-- Logs mean and std metrics for monitoring
-- Only runs when `compute_information_gain: true` in config
+- **OLD**: Measured `IG = log P(generated_response | prompt + response) - log P(generated_response | prompt)`
+- **NEW**: Measures `IG = log P(gold_solution | prompt + reasoning) - log P(gold_solution | prompt)`
+- Extracts reasoning from generated response
+- Tests if reasoning helps predict the CORRECT answer
+- Normalizes to [-1, 1] for reward stability
+- Injects into `extra_info` for reward function access
+- Logs both raw and normalized metrics
+
+**Key Insight**: This measures **reasoning quality** (does it help predict correct answer?) rather than just response likelihood.
 
 ## Data Flow
 
@@ -157,19 +266,37 @@ if self.config.get("compute_information_gain", False):
 
 2. Training starts → omnimath_curriculum_dataset.py
    └─> Loads parquet, dynamically generates partial solution prompts
-   └─> Returns batch with partial_solution_given, remaining_solution
+   └─> Returns batch with:
+       - prompt (problem + partial_solution)
+       - partial_solution_given (in reward_model dict)
+       - remaining_solution (gold, in reward_model dict)
 
-3. ray_trainer.py (lines 1116-1167)
-   ├─> Computes old_log_probs (policy)
-   ├─> Computes ref_log_prob (reference)
-   ├─> Calls omnimath_curriculum_metrics.py [NEW INJECTION]
-   │   └─> Computes policy_confidence, kl_divergence
-   │   └─> Injects into batch.non_tensor_batch
+3. Rollout phase
+   └─> Model generates responses with format:
+       **Reasoning:** [model's reasoning]
+       **Remaining Solution:** [model's answer attempt]
+
+4. ray_trainer.py - Information Gain Computation (lines 1450-1534)
+   ├─> Parse generated responses to extract reasoning sections
+   ├─> Construct TWO batches:
+   │   ├─> Batch WITH reasoning: prompt + reasoning + gold_solution
+   │   └─> Batch WITHOUT reasoning: prompt + gold_solution
+   ├─> Compute log probs for both batches
+   ├─> Calculate IG = log P(gold | prompt + reasoning) - log P(gold | prompt)
+   ├─> Normalize IG to [-1, 1]
+   └─> Inject IG into batch.non_tensor_batch["extra_info"]
+
+5. ray_trainer.py - Reward Computation
    └─> Calls omnimath_reward.py
-       └─> Receives metrics via extra_info
-       └─> Returns final reward
+       ├─> Receives IG from extra_info
+       ├─> Checks format compliance (RLVR-style)
+       └─> Returns: final_reward = normalized_IG + (0.3 × format_reward)
 
-4. GRPO updates policy with rewards
+6. GRPO updates policy
+   └─> Uses final rewards to compute advantages
+   └─> Updates policy to:
+       - Generate better reasoning (higher IG)
+       - Follow structured format (higher format reward)
 ```
 
 ## Usage

@@ -814,20 +814,63 @@ class RayPPOTrainer:
             without_reasoning_position_ids.append(pos_ids_without[0])
             without_reasoning_response_mask.append(response_mask_without_padded)
 
+        # Stack all components
+        stacked_with_input_ids = torch.stack(with_reasoning_input_ids)
+        stacked_with_attention_mask = torch.stack(with_reasoning_attention_mask)
+        stacked_with_position_ids = torch.stack(with_reasoning_position_ids)
+        stacked_with_response_mask = torch.stack(with_reasoning_response_mask)
+
+        stacked_without_input_ids = torch.stack(without_reasoning_input_ids)
+        stacked_without_attention_mask = torch.stack(without_reasoning_attention_mask)
+        stacked_without_position_ids = torch.stack(without_reasoning_position_ids)
+        stacked_without_response_mask = torch.stack(without_reasoning_response_mask)
+
+        # Extract "responses" by finding where response_mask == 1 in input_ids
+        # For "with reasoning" batch
+        with_reasoning_responses = []
+        for i in range(batch_size):
+            response_indices = (stacked_with_response_mask[i] == 1).nonzero(as_tuple=True)[0]
+            response_tokens = stacked_with_input_ids[i][response_indices]
+            # Pad to max response length in batch
+            with_reasoning_responses.append(response_tokens)
+
+        # For "without reasoning" batch
+        without_reasoning_responses = []
+        for i in range(batch_size):
+            response_indices = (stacked_without_response_mask[i] == 1).nonzero(as_tuple=True)[0]
+            response_tokens = stacked_without_input_ids[i][response_indices]
+            without_reasoning_responses.append(response_tokens)
+
+        # Pad responses to same length within each batch
+        max_response_len_with = max(len(r) for r in with_reasoning_responses)
+        max_response_len_without = max(len(r) for r in without_reasoning_responses)
+
+        padded_responses_with = []
+        for r in with_reasoning_responses:
+            padded = torch.nn.functional.pad(r, (0, max_response_len_with - len(r)), value=self.tokenizer.pad_token_id)
+            padded_responses_with.append(padded)
+
+        padded_responses_without = []
+        for r in without_reasoning_responses:
+            padded = torch.nn.functional.pad(r, (0, max_response_len_without - len(r)), value=self.tokenizer.pad_token_id)
+            padded_responses_without.append(padded)
+
         # Create batch with reasoning
         batch_with_reasoning_dict = {
-            "input_ids": torch.stack(with_reasoning_input_ids),
-            "attention_mask": torch.stack(with_reasoning_attention_mask),
-            "position_ids": torch.stack(with_reasoning_position_ids),
-            "response_mask": torch.stack(with_reasoning_response_mask),
+            "input_ids": stacked_with_input_ids,
+            "attention_mask": stacked_with_attention_mask,
+            "position_ids": stacked_with_position_ids,
+            "response_mask": stacked_with_response_mask,
+            "responses": torch.stack(padded_responses_with),  # [B, R]
         }
 
         # Create batch without reasoning
         batch_without_reasoning_dict = {
-            "input_ids": torch.stack(without_reasoning_input_ids),
-            "attention_mask": torch.stack(without_reasoning_attention_mask),
-            "position_ids": torch.stack(without_reasoning_position_ids),
-            "response_mask": torch.stack(without_reasoning_response_mask),
+            "input_ids": stacked_without_input_ids,
+            "attention_mask": stacked_without_attention_mask,
+            "position_ids": stacked_without_position_ids,
+            "response_mask": stacked_without_response_mask,
+            "responses": torch.stack(padded_responses_without),  # [B, R]
         }
 
         batch_with_reasoning = DataProto.from_single_dict(batch_with_reasoning_dict)
