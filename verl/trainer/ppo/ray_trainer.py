@@ -1230,14 +1230,28 @@ class RayPPOTrainer:
                             sum_with_cot = (log_probs_with_cot * response_masks).sum(dim=1)      # [B]
                             sum_without_cot = (log_probs_without_cot * response_masks).sum(dim=1) # [B]
 
-                            information_gain = sum_with_cot - sum_without_cot  # [B]
+                            information_gain_raw = sum_with_cot - sum_without_cot  # [B]
 
-                            # Store in batch for reward function
-                            batch.batch["information_gain"] = information_gain  # [B]
+                            # NORMALIZE INFORMATION GAIN to [-1, 1] range
+                            # Use tanh normalization with adaptive scaling based on batch statistics
+                            # This prevents extremely large IG values from dominating the reward
+                            ig_std = information_gain_raw.std() + 1e-8  # Add small epsilon to avoid division by zero
+                            ig_mean = information_gain_raw.mean()
+
+                            # Standardize: (IG - mean) / std, then apply tanh to map to [-1, 1]
+                            information_gain_normalized = torch.tanh((information_gain_raw - ig_mean) / (ig_std + 1e-8))
+
+                            # Use normalized IG as the primary metric
+                            information_gain = information_gain_normalized  # [B], range: [-1, 1]
+
+                            # Store both raw and normalized IG in batch for analysis
+                            batch.batch["information_gain_raw"] = information_gain_raw  # [B], raw values
+                            batch.batch["information_gain"] = information_gain  # [B], normalized to [-1, 1]
 
                             # CRITICAL FIX: Inject information gain into non_tensor_batch so reward function can access it
                             # Convert tensor to numpy and add to each sample's extra_info
-                            ig_numpy = information_gain.cpu().numpy()
+                            ig_numpy = information_gain.cpu().numpy()  # Normalized values
+                            ig_raw_numpy = information_gain_raw.cpu().numpy()  # Raw values for logging
 
                             # Get or initialize extra_info as a list first (for manipulation)
                             if "extra_info" not in batch.non_tensor_batch:
@@ -1248,19 +1262,30 @@ class RayPPOTrainer:
                             else:
                                 extra_info_list = list(batch.non_tensor_batch["extra_info"])
 
-                            # Inject information gain value for each sample
+                            # Inject information gain values for each sample
                             for i in range(len(batch)):
                                 if not isinstance(extra_info_list[i], dict):
                                     extra_info_list[i] = {}
+                                # Normalized IG (primary, used by reward function)
                                 extra_info_list[i]["information_gain"] = float(ig_numpy[i])
+                                # Raw IG (for analysis/logging)
+                                extra_info_list[i]["information_gain_raw"] = float(ig_raw_numpy[i])
 
                             # IMPORTANT: Convert back to numpy array (required by DataProto.chunk())
                             batch.non_tensor_batch["extra_info"] = np.array(extra_info_list, dtype=object)
 
-                            # Log metrics
+                            # Log metrics (both raw and normalized)
                             ig_metrics = {
+                                # Normalized IG ([-1, 1] range)
                                 "curriculum/information_gain_mean": information_gain.mean().item(),
                                 "curriculum/information_gain_std": information_gain.std().item(),
+                                "curriculum/information_gain_min": information_gain.min().item(),
+                                "curriculum/information_gain_max": information_gain.max().item(),
+                                # Raw IG (original scale, for comparison)
+                                "curriculum/information_gain_raw_mean": information_gain_raw.mean().item(),
+                                "curriculum/information_gain_raw_std": information_gain_raw.std().item(),
+                                "curriculum/information_gain_raw_min": information_gain_raw.min().item(),
+                                "curriculum/information_gain_raw_max": information_gain_raw.max().item(),
                             }
                             metrics.update(ig_metrics)
                     # ===== END INFORMATION GAIN =====

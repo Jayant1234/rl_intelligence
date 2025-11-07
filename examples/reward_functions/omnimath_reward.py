@@ -56,7 +56,8 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None):
         return {"score": 0.0, "warning": "No extra_info available"}
 
     # ===== EXTRACT METRICS =====
-    information_gain = extra_info.get("information_gain", None)
+    information_gain = extra_info.get("information_gain", None)  # Normalized to [-1, 1]
+    information_gain_raw = extra_info.get("information_gain_raw", None)  # Original scale
     policy_confidence = extra_info.get("policy_confidence", None)
     kl_divergence = extra_info.get("kl_divergence", None)
     partial_given = extra_info.get("partial_solution_given", "")
@@ -76,17 +77,20 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None):
     # STRATEGY: Use Information Gain as primary reward signal
     # IG = log P(answer | prompt + CoT) - log P(answer | prompt only)
     #
-    # Interpretation:
-    # - IG > 0: CoT helps the model (reasoning is useful)
-    # - IG = 0: CoT provides no information
-    # - IG < 0: CoT confuses the model (bad reasoning)
+    # The IG is NORMALIZED to [-1, 1] range using batch-level statistics:
+    # normalized_IG = tanh((raw_IG - batch_mean) / batch_std)
     #
-    # Goal: Maximize information gain = encourage useful reasoning
+    # Interpretation of normalized IG:
+    # - IG close to +1: CoT helps significantly (best reasoning in this batch)
+    # - IG close to 0: CoT provides average/neutral information
+    # - IG close to -1: CoT confuses the model (worst reasoning in this batch)
+    #
+    # Goal: Maximize normalized information gain = encourage useful reasoning
 
-    # 1. BASE REWARD: Use Information Gain directly
-    # Scale IG to a reasonable reward range
-    # Typical IG values might be in range [-10, 10], but can vary
-    base_reward = information_gain
+    # 1. BASE REWARD: Use Normalized Information Gain directly
+    # Since IG is already in [-1, 1], we can use it directly or scale it
+    # For more aggressive rewards, you can scale it:
+    base_reward = information_gain * 2.0  # Scale [-1, 1] to [-2, 2] for stronger signal
 
     # 2. CURRICULUM MULTIPLIER: Reward harder problems more
     # When solution_percentage is low (less help given), the task is harder
@@ -116,7 +120,8 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None):
     # Return detailed dict for logging and analysis
     return {
         "score": float(final_reward),
-        "information_gain": float(information_gain),
+        "information_gain": float(information_gain),  # Normalized [-1, 1]
+        "information_gain_raw": float(information_gain_raw) if information_gain_raw is not None else None,  # Original scale
         "base_reward": float(base_reward),
         "curriculum_multiplier": float(curriculum_multiplier),
         "solution_percentage": float(solution_percentage),
