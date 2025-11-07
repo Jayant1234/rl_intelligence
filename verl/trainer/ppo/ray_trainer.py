@@ -1503,13 +1503,20 @@ class RayPPOTrainer:
                             # Step 2: Compute log probs for both batches
                             # Log P(gold_solution | prompt + reasoning)
                             log_prob_with_reasoning = self.actor_rollout_wg.compute_log_prob(batch_with_reasoning)
-                            log_probs_with = log_prob_with_reasoning.batch["old_log_probs"]  # [B, R]
-                            response_masks_with = batch_with_reasoning.batch["response_mask"]  # [B, R]
+                            log_probs_with = log_prob_with_reasoning.batch["old_log_probs"]  # [B, response_length]
+
+                            # Create response mask from the responses tensor (non-padding tokens)
+                            # response_mask has shape [B, response_length] matching log_probs
+                            responses_with = batch_with_reasoning.batch["responses"]  # [B, response_length]
+                            response_masks_with = (responses_with != self.tokenizer.pad_token_id).float()  # [B, response_length]
 
                             # Log P(gold_solution | prompt only)
                             log_prob_without_reasoning = self.actor_rollout_wg.compute_log_prob(batch_without_reasoning)
-                            log_probs_without = log_prob_without_reasoning.batch["old_log_probs"]  # [B, R]
-                            response_masks_without = batch_without_reasoning.batch["response_mask"]  # [B, R]
+                            log_probs_without = log_prob_without_reasoning.batch["old_log_probs"]  # [B, response_length]
+
+                            # Create response mask from the responses tensor (non-padding tokens)
+                            responses_without = batch_without_reasoning.batch["responses"]  # [B, response_length]
+                            response_masks_without = (responses_without != self.tokenizer.pad_token_id).float()  # [B, response_length]
 
                             # Step 3: Sum log probs over gold solution tokens
                             sum_with_reasoning = (log_probs_with * response_masks_with).sum(dim=1)  # [B]

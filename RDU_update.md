@@ -317,11 +317,56 @@ data.curriculum:
   max_percentage: 0.8  # 80% of solution
   base_seed: 42
 
-custom_curriculum_metrics:
-  path: examples/reward_functions/omnimath_curriculum_metrics.py
-  name: compute_omnimath_curriculum_metrics
+compute_information_gain: true  # Enable IG computation in ray_trainer
 
 custom_reward_function:
   path: examples/reward_functions/omnimath_reward.py
   name: compute_score
 ```
+
+## Summary of Changes by File
+
+### Core Training Logic Changes
+
+**`verl/trainer/ppo/ray_trainer.py`** (3 new methods + 1 rewritten block):
+- Lines 519-602: Helper method `_construct_empty_cot_batch()` (DEPRECATED, kept for reference)
+- Lines 604-644: NEW `_parse_reasoning_from_response()` - Extracts reasoning from generated responses
+- Lines 646-879: NEW `_construct_ig_batches_with_gold_solution()` - Creates batches for IG calculation
+- Lines 1450-1534: REDESIGNED Information Gain computation block - Measures reasoning quality
+
+### Reward Function Changes
+
+**`examples/reward_functions/omnimath_reward.py`**:
+- Lines 39-114: NEW `check_format_compliance()` - RLVR-style format checking
+- Lines 117-241: UPDATED `compute_score()` - Simple reward: `IG + 0.3 × format_reward`
+
+### Prompt Engineering Changes
+
+**`examples/data_preprocess/omnimath_curriculum_dataset.py`**:
+- Lines 132-180: UPDATED `create_curriculum_prompt()` - Structured two-section format with clear instructions
+
+## Key Improvements
+
+1. **Better IG Measurement**: Now measures reasoning quality (does it help predict correct answer?) instead of response likelihood
+2. **Format Reward**: Encourages structured outputs with proper sections and boxed answers
+3. **Cleaner Prompts**: Explicit instructions for two-section format increase response quality
+4. **No Curriculum Complexity in Reward**: Removed unnecessary curriculum multipliers from reward function - curriculum is handled by dataset
+
+## Expected Behavior
+
+**Information Gain Metrics** (logged during training):
+- `curriculum/information_gain_mean`: Average normalized IG (should be near 0 initially)
+- `curriculum/information_gain_std`: Variance in IG (higher = more differentiation = better for GRPO)
+- `curriculum/information_gain_raw_*`: Raw IG values before normalization (for analysis)
+
+**Format Reward Metrics** (in reward logs):
+- `has_reasoning_header`: Fraction with **Reasoning:** header
+- `has_solution_header`: Fraction with **Solution:** header
+- `has_boxed_answer`: Fraction with `\boxed{}` answer
+- `correct_order`: Fraction with correct section order
+- `total_format_score`: Overall format compliance [0, 1]
+
+**Why This Should Work Better**:
+1. IG now directly measures reasoning quality → stronger learning signal
+2. Format reward adds within-group variance → non-zero GRPO advantages
+3. Combined reward encourages both good reasoning AND good format
