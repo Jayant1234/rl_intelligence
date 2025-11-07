@@ -40,6 +40,9 @@ def check_format_compliance(response_text: str, has_partial_solution: bool) -> d
     """
     Check if response follows the required format (RLVR-style format reward).
 
+    IMPORTANT: Headers must appear EXACTLY ONCE. If any header appears multiple times,
+    the total format score is set to 0 (complete failure).
+
     Args:
         response_text: The model's generated response
         has_partial_solution: Whether partial solution was provided in prompt
@@ -54,33 +57,63 @@ def check_format_compliance(response_text: str, has_partial_solution: bool) -> d
         "correct_order": 0.0,
         "reasoning_substantive": 0.0,
         "solution_substantive": 0.0,
+        "reasoning_header_count": 0,
+        "solution_header_count": 0,
+        "boxed_answer_count": 0,
         "total_format_score": 0.0,
     }
 
-    # Check for **Reasoning:** header
-    if re.search(r'\*\*Reasoning:\*\*', response_text, re.IGNORECASE):
+    # Check for **Reasoning:** header - must appear EXACTLY ONCE
+    reasoning_matches = list(re.finditer(r'\*\*Reasoning:\*\*', response_text, re.IGNORECASE))
+    format_scores["reasoning_header_count"] = len(reasoning_matches)
+    if len(reasoning_matches) == 1:
         format_scores["has_reasoning_header"] = 1.0
-
-    # Check for solution header (depends on prompt type)
-    if has_partial_solution:
-        # Should have "**Remaining Solution:**"
-        if re.search(r'\*\*Remaining Solution:\*\*', response_text, re.IGNORECASE):
-            format_scores["has_solution_header"] = 1.0
+        reasoning_match = reasoning_matches[0]
+    elif len(reasoning_matches) > 1:
+        # Multiple occurrences - set total score to 0 and return immediately
+        format_scores["total_format_score"] = 0.0
+        return format_scores
     else:
-        # Should have "**Solution:**"
-        if re.search(r'\*\*Solution:\*\*', response_text, re.IGNORECASE):
-            format_scores["has_solution_header"] = 1.0
+        reasoning_match = None
 
-    # Check for \boxed{} answer
-    if re.search(r'\\boxed\{[^}]+\}', response_text):
+    # Check for solution header (depends on prompt type) - must appear EXACTLY ONCE
+    if has_partial_solution:
+        # Should have "**Remaining Solution:**" exactly once
+        solution_matches = list(re.finditer(r'\*\*Remaining Solution:\*\*', response_text, re.IGNORECASE))
+    else:
+        # Should have "**Solution:**" exactly once (but NOT "Remaining Solution")
+        solution_matches = list(re.finditer(r'\*\*Solution:\*\*', response_text, re.IGNORECASE))
+        # Exclude "**Remaining Solution:**" from matches
+        solution_matches = [m for m in solution_matches
+                           if not response_text[max(0, m.start()-10):m.end()].lower().endswith('remaining solution:**')]
+
+    format_scores["solution_header_count"] = len(solution_matches)
+    if len(solution_matches) == 1:
+        format_scores["has_solution_header"] = 1.0
+        solution_match = solution_matches[0]
+    elif len(solution_matches) > 1:
+        # Multiple occurrences - set total score to 0 and return immediately
+        format_scores["total_format_score"] = 0.0
+        return format_scores
+    else:
+        solution_match = None
+
+    # Check for \boxed{} answer - must appear EXACTLY ONCE
+    boxed_matches = list(re.finditer(r'\\boxed\{[^}]+\}', response_text))
+    format_scores["boxed_answer_count"] = len(boxed_matches)
+    if len(boxed_matches) == 1:
         format_scores["has_boxed_answer"] = 1.0
+        boxed_match = boxed_matches[0]
+    elif len(boxed_matches) > 1:
+        # Multiple occurrences - set total score to 0 and return immediately
+        format_scores["total_format_score"] = 0.0
+        return format_scores
+    else:
+        boxed_match = None
 
-    # Check correct order: Reasoning should come before Solution
-    reasoning_match = re.search(r'\*\*Reasoning:\*\*', response_text, re.IGNORECASE)
-    solution_match = re.search(r'\*\*(Remaining )?Solution:\*\*', response_text, re.IGNORECASE)
-
-    if reasoning_match and solution_match:
-        if reasoning_match.start() < solution_match.start():
+    # Check correct order: Reasoning → Solution → boxed answer
+    if reasoning_match and solution_match and boxed_match:
+        if reasoning_match.start() < solution_match.start() < boxed_match.start():
             format_scores["correct_order"] = 1.0
 
     # Check if reasoning section is substantive (at least 20 chars)
@@ -229,6 +262,9 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None):
         "correct_order": float(format_scores["correct_order"]),
         "reasoning_substantive": float(format_scores["reasoning_substantive"]),
         "solution_substantive": float(format_scores["solution_substantive"]),
+        "reasoning_header_count": int(format_scores["reasoning_header_count"]),
+        "solution_header_count": int(format_scores["solution_header_count"]),
+        "boxed_answer_count": int(format_scores["boxed_answer_count"]),
 
         # Metadata for analysis
         "solution_percentage": float(solution_percentage),

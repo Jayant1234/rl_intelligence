@@ -1614,6 +1614,31 @@ class RayPPOTrainer:
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
+                            # Aggregate format reward metrics for logging
+                            # Note: IG metrics are already logged separately at lines 1573-1583
+                            format_metric_keys = [
+                                "format_reward", "format_reward_scaled",
+                                "has_reasoning_header", "has_solution_header", "has_boxed_answer",
+                                "correct_order", "reasoning_substantive", "solution_substantive",
+                                "reasoning_header_count", "solution_header_count", "boxed_answer_count"
+                            ]
+
+                            format_metrics = {}
+                            for key in format_metric_keys:
+                                if key in reward_extra_infos_dict:
+                                    values = reward_extra_infos_dict[key]
+                                    # Only aggregate numeric values, keep NaN values (don't filter)
+                                    if values and isinstance(values[0], (int, float, np.integer, np.floating)):
+                                        values_array = np.array(values, dtype=np.float32)
+                                        format_metrics[f"format/{key}_mean"] = float(np.mean(values_array))
+                                        # Add std, min, max for non-count metrics
+                                        if not key.endswith("_count"):
+                                            format_metrics[f"format/{key}_std"] = float(np.std(values_array))
+                                            format_metrics[f"format/{key}_min"] = float(np.min(values_array))
+                                            format_metrics[f"format/{key}_max"] = float(np.max(values_array))
+
+                            metrics.update(format_metrics)
+
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
                             batch, kl_metrics = apply_kl_penalty(
