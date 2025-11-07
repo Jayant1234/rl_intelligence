@@ -1238,18 +1238,24 @@ class RayPPOTrainer:
                             # CRITICAL FIX: Inject information gain into non_tensor_batch so reward function can access it
                             # Convert tensor to numpy and add to each sample's extra_info
                             ig_numpy = information_gain.cpu().numpy()
-                            for i in range(len(batch)):
-                                # Initialize extra_info if it doesn't exist
-                                if "extra_info" not in batch.non_tensor_batch:
-                                    batch.non_tensor_batch["extra_info"] = [{} for _ in range(len(batch))]
-                                elif not isinstance(batch.non_tensor_batch["extra_info"], list):
-                                    # Convert to list if it's numpy array
-                                    batch.non_tensor_batch["extra_info"] = list(batch.non_tensor_batch["extra_info"])
 
-                                # Inject information gain value for this sample
-                                if not isinstance(batch.non_tensor_batch["extra_info"][i], dict):
-                                    batch.non_tensor_batch["extra_info"][i] = {}
-                                batch.non_tensor_batch["extra_info"][i]["information_gain"] = float(ig_numpy[i])
+                            # Get or initialize extra_info as a list first (for manipulation)
+                            if "extra_info" not in batch.non_tensor_batch:
+                                extra_info_list = [{} for _ in range(len(batch))]
+                            elif isinstance(batch.non_tensor_batch["extra_info"], np.ndarray):
+                                # Convert numpy array to list for manipulation
+                                extra_info_list = list(batch.non_tensor_batch["extra_info"])
+                            else:
+                                extra_info_list = list(batch.non_tensor_batch["extra_info"])
+
+                            # Inject information gain value for each sample
+                            for i in range(len(batch)):
+                                if not isinstance(extra_info_list[i], dict):
+                                    extra_info_list[i] = {}
+                                extra_info_list[i]["information_gain"] = float(ig_numpy[i])
+
+                            # IMPORTANT: Convert back to numpy array (required by DataProto.chunk())
+                            batch.non_tensor_batch["extra_info"] = np.array(extra_info_list, dtype=object)
 
                             # Log metrics
                             ig_metrics = {
