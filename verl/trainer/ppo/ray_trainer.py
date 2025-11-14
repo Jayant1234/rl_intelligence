@@ -698,16 +698,8 @@ class RayPPOTrainer:
             response_tokens = response_tokens[:valid_response_len]
             response_text = self.tokenizer.decode(response_tokens, skip_special_tokens=True)
 
-            # DEBUG: Print first few responses to check if they're different within groups
-            if i < 6:  # Print first 6 samples (2 groups if n=3)
-                print(f"[IG DEBUG] Sample {i}: response_text[:100] = {response_text[:100]}")
-
             # Parse response to extract thinking (content inside <think>...</think>)
             thinking_text, _ = self._parse_reasoning_from_response(response_text)
-
-            # DEBUG: Print extracted thinking
-            if i < 6:
-                print(f"[IG DEBUG] Sample {i}: thinking_text[:80] = {thinking_text[:80]}")
 
             # Build context for document continuation format
             if partial_solution_given.strip():
@@ -1538,11 +1530,6 @@ class RayPPOTrainer:
                             # Negative IG = reasoning hurts (confuses model)
                             information_gain_raw = sum_with_reasoning - sum_without_reasoning  # [B]
 
-                            # DEBUG: Print IG raw values for first 6 samples
-                            print(f"[IG DEBUG] Raw IG values (first 6): {information_gain_raw[:6].tolist()}")
-                            print(f"[IG DEBUG] sum_with_reasoning (first 6): {sum_with_reasoning[:6].tolist()}")
-                            print(f"[IG DEBUG] sum_without_reasoning (first 6): {sum_without_reasoning[:6].tolist()}")
-
                             # NORMALIZE INFORMATION GAIN to [-1, 1] range using batch statistics
                             # This prevents extremely large IG values from dominating the reward
                             ig_std = information_gain_raw.std() + 1e-8
@@ -1554,9 +1541,6 @@ class RayPPOTrainer:
                             # Use normalized IG as the primary metric
                             information_gain = information_gain_normalized  # [B], range: [-1, 1]
 
-                            # DEBUG: Print normalized IG
-                            print(f"[IG DEBUG] Normalized IG (first 6): {information_gain[:6].tolist()}")
-
                             # Store both raw and normalized IG in batch for analysis
                             batch.batch["information_gain_raw"] = information_gain_raw  # [B], raw values
                             batch.batch["information_gain"] = information_gain  # [B], normalized to [-1, 1]
@@ -1566,12 +1550,18 @@ class RayPPOTrainer:
                             ig_raw_numpy = information_gain_raw.cpu().numpy()  # Raw values for logging
 
                             # Get or initialize extra_info as a list first (for manipulation)
+                            # CRITICAL: Deep copy each dict to avoid shared references after batch.repeat()
+                            import copy
                             if "extra_info" not in batch.non_tensor_batch:
                                 extra_info_list = [{} for _ in range(len(batch))]
                             elif isinstance(batch.non_tensor_batch["extra_info"], np.ndarray):
-                                extra_info_list = list(batch.non_tensor_batch["extra_info"])
+                                # DEEP COPY to avoid shared dict references within GRPO groups
+                                extra_info_list = [copy.deepcopy(item) if isinstance(item, dict) else {}
+                                                   for item in batch.non_tensor_batch["extra_info"]]
                             else:
-                                extra_info_list = list(batch.non_tensor_batch["extra_info"])
+                                # DEEP COPY to avoid shared dict references within GRPO groups
+                                extra_info_list = [copy.deepcopy(item) if isinstance(item, dict) else {}
+                                                   for item in batch.non_tensor_batch["extra_info"]]
 
                             # Inject information gain values for each sample
                             for i in range(len(batch)):
