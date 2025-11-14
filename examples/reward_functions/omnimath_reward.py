@@ -36,137 +36,171 @@ Additional metrics for analysis:
 import re
 
 
-def check_format_compliance(response_text: str, has_partial_solution: bool) -> dict:
+def check_format_compliance(response_text: str, has_partial_solution: bool = None) -> dict:
     """
-    Check if response follows the required format (RLVR-style format reward).
+    Check if response follows the required document continuation format.
 
-    IMPORTANT: Headers must appear EXACTLY ONCE. If any header appears multiple times,
-    the total format score is set to 0 (complete failure).
+    IMPORTANT: This uses BINARY scoring - the model must pass ALL checks to get format_score=1.0.
+    If any check fails, format_score=0.0.
+
+    Tags are CASE-SENSITIVE and must be lowercase.
+
+    Expected format:
+        <think>
+        [long, detailed planning - at least 100 chars]
+        </think>
+        <|startofprediction|>
+        [continuation - at least 10 chars]
+        <|endofprediction|>
 
     Args:
         response_text: The model's generated response
-        has_partial_solution: Whether partial solution was provided in prompt
+        has_partial_solution: DEPRECATED - no longer used (format is same regardless)
 
     Returns:
         dict with format compliance scores and breakdown
     """
     format_scores = {
-        "has_reasoning_header": 0.0,
-        "has_solution_header": 0.0,
-        "has_boxed_answer": 0.0,
+        "has_think_open": 0.0,
+        "has_think_close": 0.0,
+        "has_prediction_open": 0.0,
+        "has_prediction_close": 0.0,
         "correct_order": 0.0,
-        "reasoning_substantive": 0.0,
-        "solution_substantive": 0.0,
-        "reasoning_header_count": 0,
-        "solution_header_count": 0,
-        "boxed_answer_count": 0,
+        "think_substantive": 0.0,
+        "prediction_substantive": 0.0,
+        "think_open_count": 0,
+        "think_close_count": 0,
+        "prediction_open_count": 0,
+        "prediction_close_count": 0,
         "total_format_score": 0.0,
     }
 
-    # Check for **Reasoning:** header - must appear EXACTLY ONCE
-    reasoning_matches = list(re.finditer(r'\*\*Reasoning:\*\*', response_text, re.IGNORECASE))
-    format_scores["reasoning_header_count"] = len(reasoning_matches)
-    if len(reasoning_matches) == 1:
-        format_scores["has_reasoning_header"] = 1.0
-        reasoning_match = reasoning_matches[0]
-    elif len(reasoning_matches) > 1:
+    # Check for <think> opening tag - must appear EXACTLY ONCE (case-sensitive)
+    think_open_matches = list(re.finditer(r'<think>', response_text))
+    format_scores["think_open_count"] = len(think_open_matches)
+    if len(think_open_matches) == 1:
+        format_scores["has_think_open"] = 1.0
+        think_open_match = think_open_matches[0]
+    elif len(think_open_matches) > 1:
         # Multiple occurrences - set total score to 0 and return immediately
         format_scores["total_format_score"] = 0.0
         return format_scores
     else:
-        reasoning_match = None
+        think_open_match = None
 
-    # Check for solution header (depends on prompt type) - must appear EXACTLY ONCE
-    if has_partial_solution:
-        # Should have "**Remaining Solution:**" exactly once
-        solution_matches = list(re.finditer(r'\*\*Remaining Solution:\*\*', response_text, re.IGNORECASE))
-    else:
-        # Should have "**Solution:**" exactly once (but NOT "Remaining Solution")
-        solution_matches = list(re.finditer(r'\*\*Solution:\*\*', response_text, re.IGNORECASE))
-        # Exclude "**Remaining Solution:**" from matches
-        solution_matches = [m for m in solution_matches
-                           if not response_text[max(0, m.start()-10):m.end()].lower().endswith('remaining solution:**')]
-
-    format_scores["solution_header_count"] = len(solution_matches)
-    if len(solution_matches) == 1:
-        format_scores["has_solution_header"] = 1.0
-        solution_match = solution_matches[0]
-    elif len(solution_matches) > 1:
+    # Check for </think> closing tag - must appear EXACTLY ONCE (case-sensitive)
+    think_close_matches = list(re.finditer(r'</think>', response_text))
+    format_scores["think_close_count"] = len(think_close_matches)
+    if len(think_close_matches) == 1:
+        format_scores["has_think_close"] = 1.0
+        think_close_match = think_close_matches[0]
+    elif len(think_close_matches) > 1:
         # Multiple occurrences - set total score to 0 and return immediately
         format_scores["total_format_score"] = 0.0
         return format_scores
     else:
-        solution_match = None
+        think_close_match = None
 
-    # Check for \boxed{} answer - must appear EXACTLY ONCE
-    boxed_matches = list(re.finditer(r'\\boxed\{[^}]+\}', response_text))
-    format_scores["boxed_answer_count"] = len(boxed_matches)
-    if len(boxed_matches) == 1:
-        format_scores["has_boxed_answer"] = 1.0
-        boxed_match = boxed_matches[0]
-    elif len(boxed_matches) > 1:
+    # Check for <|startofprediction|> tag - must appear EXACTLY ONCE (case-sensitive)
+    prediction_open_matches = list(re.finditer(r'<\|startofprediction\|>', response_text))
+    format_scores["prediction_open_count"] = len(prediction_open_matches)
+    if len(prediction_open_matches) == 1:
+        format_scores["has_prediction_open"] = 1.0
+        prediction_open_match = prediction_open_matches[0]
+    elif len(prediction_open_matches) > 1:
         # Multiple occurrences - set total score to 0 and return immediately
         format_scores["total_format_score"] = 0.0
         return format_scores
     else:
-        boxed_match = None
+        prediction_open_match = None
 
-    # Check correct order: Reasoning → Solution → boxed answer
-    if reasoning_match and solution_match and boxed_match:
-        if reasoning_match.start() < solution_match.start() < boxed_match.start():
+    # Check for <|endofprediction|> tag - must appear EXACTLY ONCE (case-sensitive)
+    prediction_close_matches = list(re.finditer(r'<\|endofprediction\|>', response_text))
+    format_scores["prediction_close_count"] = len(prediction_close_matches)
+    if len(prediction_close_matches) == 1:
+        format_scores["has_prediction_close"] = 1.0
+        prediction_close_match = prediction_close_matches[0]
+    elif len(prediction_close_matches) > 1:
+        # Multiple occurrences - set total score to 0 and return immediately
+        format_scores["total_format_score"] = 0.0
+        return format_scores
+    else:
+        prediction_close_match = None
+
+    # Check correct order: <think> → </think> → <|startofprediction|> → <|endofprediction|>
+    if think_open_match and think_close_match and prediction_open_match and prediction_close_match:
+        if (think_open_match.start() < think_close_match.start() <
+            prediction_open_match.start() < prediction_close_match.start()):
             format_scores["correct_order"] = 1.0
 
-    # Check if reasoning section is substantive (at least 20 chars)
-    if reasoning_match:
-        reasoning_start = reasoning_match.end()
-        # Find end of reasoning section (next header or end of text)
-        solution_start = solution_match.start() if solution_match else len(response_text)
-        reasoning_content = response_text[reasoning_start:solution_start].strip()
+    # Check if think section is substantive (at least 100 chars - prompt says "long and detailed, 1000-2000 tokens")
+    if think_open_match and think_close_match:
+        think_start = think_open_match.end()
+        think_end = think_close_match.start()
+        think_content = response_text[think_start:think_end].strip()
 
-        if len(reasoning_content) >= 20:  # At least 20 characters
-            format_scores["reasoning_substantive"] = 1.0
+        if len(think_content) >= 100:  # At least 100 characters
+            format_scores["think_substantive"] = 1.0
 
-    # Check if solution section is substantive (at least 10 chars)
-    if solution_match:
-        solution_start = solution_match.end()
-        solution_content = response_text[solution_start:].strip()
+    # Check if prediction section is substantive (at least 10 chars)
+    if prediction_open_match and prediction_close_match:
+        prediction_start = prediction_open_match.end()
+        prediction_end = prediction_close_match.start()
+        prediction_content = response_text[prediction_start:prediction_end].strip()
 
-        if len(solution_content) >= 10:  # At least 10 characters
-            format_scores["solution_substantive"] = 1.0
+        if len(prediction_content) >= 10:  # At least 10 characters
+            format_scores["prediction_substantive"] = 1.0
 
-    # Calculate total format score (all components weighted equally)
-    format_scores["total_format_score"] = sum([
-        format_scores["has_reasoning_header"],
-        format_scores["has_solution_header"],
-        format_scores["has_boxed_answer"],
-        format_scores["correct_order"],
-        format_scores["reasoning_substantive"],
-        format_scores["solution_substantive"],
-    ]) / 6.0  # Normalize to [0, 1]
+    # BINARY ALL-OR-NOTHING SCORING
+    # Model must pass ALL 7 checks to get format_score = 1.0
+    all_checks_pass = all([
+        format_scores["has_think_open"] == 1.0,
+        format_scores["has_think_close"] == 1.0,
+        format_scores["has_prediction_open"] == 1.0,
+        format_scores["has_prediction_close"] == 1.0,
+        format_scores["correct_order"] == 1.0,
+        format_scores["think_substantive"] == 1.0,
+        format_scores["prediction_substantive"] == 1.0,
+    ])
+
+    format_scores["total_format_score"] = 1.0 if all_checks_pass else 0.0
 
     return format_scores
 
 
 def compute_score(data_source, solution_str, ground_truth, extra_info=None):
     """
-    Compute reward combining Information Gain + Format Reward (RLVR-style).
+    Compute reward combining Binary Information Gain + Binary Format Reward.
 
     This reward function combines:
-    1. Information Gain (IG): Measures if CoT reasoning helps the model
-       IG = log P(answer | prompt + CoT) - log P(answer | prompt only)
+    1. Information Gain (IG - BINARIZED): Measures if thinking helps the model
+       IG = log P(answer | prompt + thinking) - log P(answer | prompt only)
+       BINARY THRESHOLD:
+       - If IG > 0: ig_reward = 1.0 (thinking helps)
+       - If IG ≤ 0: ig_reward = 0.0 (thinking doesn't help)
 
-    2. Format Reward: Rewards proper response structure (RLVR-style)
-       - Has **Reasoning:** section
-       - Has **Solution:** or **Remaining Solution:** section
-       - Sections in correct order
-       - Contains \\boxed{} with answer
+    2. Format Reward (BINARY): Rewards proper document continuation structure
+       Model must have ALL of the following to get format_reward=1.0:
+       - Exactly one <think> opening tag
+       - Exactly one </think> closing tag
+       - Exactly one <|startofprediction|> tag
+       - Exactly one <|endofprediction|> tag
+       - Correct order: <think> → </think> → <|startofprediction|> → <|endofprediction|>
+       - Think section has ≥ 100 characters
+       - Prediction section has ≥ 10 characters
+
+       If ANY check fails, format_reward=0.0 (all-or-nothing)
+
+    Final Reward Range: [-0.3, 1.3]
+       - Best: IG=1, format=1 → 1.3
+       - Worst: IG=0, format=0 → -0.3
 
     Args:
         data_source (str): Dataset identifier (e.g., 'KbsdJames/Omni-MATH')
         solution_str (str): Model's generated response (decoded text)
-        ground_truth (str): Final answer from dataset
+        ground_truth (str): Final answer from dataset (not used for scoring currently)
         extra_info (dict): Contains computed metrics:
-            - information_gain: float, IG = log P(answer|CoT) - log P(answer|no CoT)
+            - information_gain: float, IG = log P(answer|thinking) - log P(answer|no thinking)
             - policy_confidence: float, model's average token probability (optional)
             - kl_divergence: float, KL(policy || reference) (optional)
             - partial_solution_given: str, solution in prompt
@@ -198,51 +232,55 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None):
             "warning": "information_gain not found in extra_info. Set compute_information_gain=True"
         }
 
-    # ===== COMPONENT 1: INFORMATION GAIN REWARD =====
+    # ===== COMPONENT 1: INFORMATION GAIN REWARD (BINARIZED) =====
 
     # STRATEGY: Use Information Gain as primary reward signal
-    # IG = log P(answer | prompt + CoT) - log P(answer | prompt only)
+    # IG = log P(answer | prompt + thinking) - log P(answer | prompt only)
     #
     # The IG is NORMALIZED to [-1, 1] range using batch-level statistics:
     # normalized_IG = tanh((raw_IG - batch_mean) / batch_std)
     #
-    # Interpretation of normalized IG:
-    # - IG close to +1: CoT helps significantly (best reasoning in this batch)
-    # - IG close to 0: CoT provides average/neutral information
-    # - IG close to -1: CoT confuses the model (worst reasoning in this batch)
+    # BINARIZATION: Threshold at 0
+    # - If IG > 0 (thinking helps): reward = +1
+    # - If IG ≤ 0 (thinking hurts or neutral): reward = 0
     #
-    # Goal: Maximize normalized information gain = encourage useful reasoning
+    # Goal: Encourage thinking that provides positive information gain
 
-    # Use normalized IG directly as the IG reward component
-    ig_reward = information_gain  # [-1, 1]
+    # Binarize IG: positive → +1, negative/zero → 0
+    ig_reward = 1.0 if information_gain > 0 else 0.0
 
-    # ===== COMPONENT 2: FORMAT REWARD (RLVR-style) =====
+    # ===== COMPONENT 2: FORMAT REWARD (BINARY) =====
 
-    # Check if response follows the required format
-    has_partial_solution = len(partial_given.strip()) > 0
-    format_scores = check_format_compliance(solution_str, has_partial_solution)
+    # Check if response follows the required document continuation format
+    # Note: has_partial_solution no longer needed - format is same regardless
+    format_scores = check_format_compliance(solution_str)
 
-    # Extract format metrics
-    format_reward = format_scores["total_format_score"]  # [0, 1]
+    # Extract format metrics - now BINARY (0.0 or 1.0 only)
+    format_reward = format_scores["total_format_score"]  # Binary: 0.0 or 1.0
 
     # Scale format reward to match IG reward magnitude
-    # IG reward is roughly [-3, 3], so scale format reward to [-1, 1]
-    # Give positive reward for good format, negative for bad format
-    format_reward_scaled = (format_reward - 0.5) * 2.0  # Map [0, 1] to [-1, 1]
+    # Format reward is binary {0, 1}, scale to {-1, 1}
+    # Give positive reward for perfect format, negative for any format failure
+    format_reward_scaled = (format_reward - 0.5) * 2.0  # Map {0, 1} to {-1, 1}
 
     # ===== COMBINE REWARDS =====
 
     # Weight for format reward (adjust based on importance)
-    # Start with 0.3 to make format 30% as important as IG
+    # With both IG and format binary, this controls format's contribution
     format_weight = 0.3
 
-    # Final combined reward: simple sum of IG + weighted format reward
+    # Final combined reward: binary IG + weighted binary format
+    # Possible reward values:
+    # - IG=1, format=1: 1.0 + 0.3 = 1.3 (best: good thinking + correct format)
+    # - IG=1, format=0: 1.0 - 0.3 = 0.7 (good thinking, bad format)
+    # - IG=0, format=1: 0.0 + 0.3 = 0.3 (bad/neutral thinking, correct format)
+    # - IG=0, format=0: 0.0 - 0.3 = -0.3 (worst: bad thinking + bad format)
     final_reward = ig_reward + (format_weight * format_reward_scaled)
 
-    # Note: We don't clip the reward because:
-    # - Negative IG rewards are informative (tell model reasoning was harmful)
-    # - Format reward adds differentiation between responses in same group
-    # - This increases within-group variance for GRPO advantages
+    # Note:
+    # - Binary IG creates clear signal: thinking either helps (1) or doesn't (0)
+    # - Format reward provides within-group variance for GRPO advantages
+    # - Negative rewards are possible when both IG and format fail
 
     # Return detailed dict for logging and analysis
     return {
@@ -253,18 +291,20 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None):
         "information_gain_raw": float(information_gain_raw) if information_gain_raw is not None else None,  # Original scale
         "ig_reward": float(ig_reward),
 
-        # Format metrics
-        "format_reward": float(format_reward),  # [0, 1]
-        "format_reward_scaled": float(format_reward_scaled),  # [-1, 1]
-        "has_reasoning_header": float(format_scores["has_reasoning_header"]),
-        "has_solution_header": float(format_scores["has_solution_header"]),
-        "has_boxed_answer": float(format_scores["has_boxed_answer"]),
+        # Format metrics (new tag-based format)
+        "format_reward": float(format_reward),  # Binary: 0.0 or 1.0
+        "format_reward_scaled": float(format_reward_scaled),  # Binary: -1.0 or 1.0
+        "has_think_open": float(format_scores["has_think_open"]),
+        "has_think_close": float(format_scores["has_think_close"]),
+        "has_prediction_open": float(format_scores["has_prediction_open"]),
+        "has_prediction_close": float(format_scores["has_prediction_close"]),
         "correct_order": float(format_scores["correct_order"]),
-        "reasoning_substantive": float(format_scores["reasoning_substantive"]),
-        "solution_substantive": float(format_scores["solution_substantive"]),
-        "reasoning_header_count": int(format_scores["reasoning_header_count"]),
-        "solution_header_count": int(format_scores["solution_header_count"]),
-        "boxed_answer_count": int(format_scores["boxed_answer_count"]),
+        "think_substantive": float(format_scores["think_substantive"]),
+        "prediction_substantive": float(format_scores["prediction_substantive"]),
+        "think_open_count": int(format_scores["think_open_count"]),
+        "think_close_count": int(format_scores["think_close_count"]),
+        "prediction_open_count": int(format_scores["prediction_open_count"]),
+        "prediction_close_count": int(format_scores["prediction_close_count"]),
 
         # Metadata for analysis
         "solution_percentage": float(solution_percentage),

@@ -601,84 +601,90 @@ class RayPPOTrainer:
 
         return empty_cot_batch
 
-    def _parse_reasoning_from_response(self, response_text: str, has_partial_solution: bool) -> tuple[str, str]:
+    def _parse_reasoning_from_response(self, response_text: str, has_partial_solution: bool = None) -> tuple[str, str]:
         """
-        Parse the generated response to extract reasoning and remaining_solution sections.
+        Parse the generated response to extract thinking and prediction sections.
+
+        Expected format:
+            <think>
+            [thinking content]
+            </think>
+            <|startofprediction|>
+            [prediction content]
+            <|endofprediction|>
 
         Args:
             response_text: Full generated response text
-            has_partial_solution: Whether prompt had partial solution (determines header format)
+            has_partial_solution: DEPRECATED - no longer used (format is same regardless)
 
         Returns:
-            tuple of (reasoning_text, generated_remaining_solution_text)
+            tuple of (thinking_text, prediction_text)
         """
         import re
 
-        # Find **Reasoning:** section
-        reasoning_match = re.search(r'\*\*Reasoning:\*\*', response_text, re.IGNORECASE)
+        # Find <think> and </think> tags (case-sensitive)
+        think_open_match = re.search(r'<think>', response_text)
+        think_close_match = re.search(r'</think>', response_text)
 
-        # Find solution section (depends on whether we had partial solution)
-        if has_partial_solution:
-            solution_match = re.search(r'\*\*Remaining Solution:\*\*', response_text, re.IGNORECASE)
+        # Find <|startofprediction|> and <|endofprediction|> tags (case-sensitive)
+        prediction_open_match = re.search(r'<\|startofprediction\|>', response_text)
+        prediction_close_match = re.search(r'<\|endofprediction\|>', response_text)
+
+        # Extract thinking content if tags exist
+        if think_open_match and think_close_match:
+            think_start = think_open_match.end()
+            think_end = think_close_match.start()
+            thinking_text = response_text[think_start:think_end].strip()
         else:
-            solution_match = re.search(r'\*\*Solution:\*\*', response_text, re.IGNORECASE)
+            # No valid thinking tags found - treat entire response as thinking
+            thinking_text = response_text.strip()
 
-        if not reasoning_match:
-            # No reasoning section found - treat entire response as reasoning
-            return response_text, ""
-
-        reasoning_start = reasoning_match.end()
-
-        if solution_match:
-            # Extract reasoning (between reasoning header and solution header)
-            reasoning_end = solution_match.start()
-            reasoning_text = response_text[reasoning_start:reasoning_end].strip()
-
-            # Extract generated remaining solution (after solution header)
-            generated_solution_text = response_text[solution_match.end():].strip()
+        # Extract prediction content if tags exist
+        if prediction_open_match and prediction_close_match:
+            prediction_start = prediction_open_match.end()
+            prediction_end = prediction_close_match.start()
+            prediction_text = response_text[prediction_start:prediction_end].strip()
         else:
-            # No solution section found - everything after reasoning header is reasoning
-            reasoning_text = response_text[reasoning_start:].strip()
-            generated_solution_text = ""
+            # No valid prediction tags found - empty prediction
+            prediction_text = ""
 
-        return reasoning_text, generated_solution_text
+        return thinking_text, prediction_text
 
     def _construct_ig_batches_with_gold_solution(self, batch: DataProto) -> tuple[DataProto, DataProto]:
         """
         Construct two batches for Information Gain calculation:
-        1. Batch WITH reasoning: prompt + partial_solution + reasoning + gold_remaining_solution
-        2. Batch WITHOUT reasoning: prompt + partial_solution + gold_remaining_solution
+        1. Batch WITH thinking: Full doc continuation prompt + <think>thinking</think> + <|startofprediction|>gold_solution<|endofprediction|>
+        2. Batch WITHOUT thinking: Simple baseline = problem + partial_solution + gold_solution (no special formatting)
 
-        New IG formula:
-        IG = log P(gold_remaining_solution | prompt + reasoning) - log P(gold_remaining_solution | prompt)
+        IG formula:
+        IG = log P(gold_solution | doc_format + thinking) - log P(gold_solution | simple_baseline)
 
-        This measures: "Does the model's reasoning help predict the CORRECT answer?"
+        This measures: "Does our document continuation approach with thinking help compared to vanilla baseline?"
 
         Args:
             batch: Original batch with generated responses
 
         Returns:
-            tuple of (batch_with_reasoning, batch_without_reasoning)
+            tuple of (batch_with_thinking, batch_without_thinking)
         """
         import torch
         from verl import DataProto
         import verl.utils.torch_functional as verl_F
         from verl.utils.model import compute_position_id_with_mask
-        from examples.data_preprocess.omnimath_curriculum_dataset import create_curriculum_prompt
 
         batch_size = len(batch)
         responses = batch.batch["responses"]  # [B, R] - generated responses
 
         # Lists to store batch components
-        with_reasoning_input_ids = []
-        with_reasoning_attention_mask = []
-        with_reasoning_position_ids = []
-        with_reasoning_response_mask = []
+        with_thinking_input_ids = []
+        with_thinking_attention_mask = []
+        with_thinking_position_ids = []
+        with_thinking_response_mask = []
 
-        without_reasoning_input_ids = []
-        without_reasoning_attention_mask = []
-        without_reasoning_position_ids = []
-        without_reasoning_response_mask = []
+        without_thinking_input_ids = []
+        without_thinking_attention_mask = []
+        without_thinking_position_ids = []
+        without_thinking_response_mask = []
 
         for i in range(batch_size):
             # Get original prompt components
@@ -686,71 +692,75 @@ class RayPPOTrainer:
             partial_solution_given = batch.non_tensor_batch["reward_model"][i]["partial_solution_given"]
             gold_remaining_solution = batch.non_tensor_batch["reward_model"][i]["remaining_solution"]
 
-            has_partial_solution = len(partial_solution_given.strip()) > 0
-
             # Decode the generated response
             response_tokens = responses[i]  # [R]
             valid_response_len = batch.batch["response_mask"][i].sum().item()
             response_tokens = response_tokens[:valid_response_len]
             response_text = self.tokenizer.decode(response_tokens, skip_special_tokens=True)
 
-            # Parse response to extract reasoning
-            reasoning_text, _ = self._parse_reasoning_from_response(response_text, has_partial_solution)
+            # DEBUG: Print first few responses to check if they're different within groups
+            if i < 6:  # Print first 6 samples (2 groups if n=3)
+                print(f"[IG DEBUG] Sample {i}: response_text[:100] = {response_text[:100]}")
 
-            # ===== CONSTRUCT PROMPT WITH REASONING =====
-            # Format: problem + partial_solution + "**Reasoning:**\n" + reasoning + "**Solution:**\n" + gold_solution
-            if has_partial_solution:
-                prompt_with_reasoning = (
-                    f"{problem}\n\n"
-                    f"A partial solution is provided below:\n\n"
-                    f"{partial_solution_given}\n\n"
-                    f"**Reasoning:**\n"
-                    f"{reasoning_text}\n\n"
-                    f"**Remaining Solution:**\n"
-                    f"{gold_remaining_solution}"
-                )
-            else:
-                prompt_with_reasoning = (
-                    f"{problem}\n\n"
-                    f"**Reasoning:**\n"
-                    f"{reasoning_text}\n\n"
-                    f"**Solution:**\n"
-                    f"{gold_remaining_solution}"
-                )
+            # Parse response to extract thinking (content inside <think>...</think>)
+            thinking_text, _ = self._parse_reasoning_from_response(response_text)
 
-            # ===== CONSTRUCT PROMPT WITHOUT REASONING =====
-            # Format: problem + partial_solution + gold_solution (no reasoning)
-            if has_partial_solution:
-                prompt_without_reasoning = (
-                    f"{problem}\n\n"
-                    f"A partial solution is provided below:\n\n"
-                    f"{partial_solution_given}\n\n"
-                    f"**Remaining Solution:**\n"
-                    f"{gold_remaining_solution}"
-                )
+            # DEBUG: Print extracted thinking
+            if i < 6:
+                print(f"[IG DEBUG] Sample {i}: thinking_text[:80] = {thinking_text[:80]}")
+
+            # Build context for document continuation format
+            if partial_solution_given.strip():
+                context = f"{problem}\n\n{partial_solution_given}"
             else:
-                prompt_without_reasoning = (
-                    f"{problem}\n\n"
-                    f"**Solution:**\n"
-                    f"{gold_remaining_solution}"
-                )
+                context = problem
+
+            # ===== CONSTRUCT PROMPT WITH THINKING (Full Document Continuation Format) =====
+            prompt_with_thinking = (
+                "You are reading a mathematical document that contains problems and worked solutions (e.g., contest problems with full answers).\n\n"
+                "The text under ### Context is the beginning of one such problem–solution segment.\n"
+                "Your goal is to continue this document so that the solution is completed in a way that is mathematically correct and stylistically consistent with the context.\n\n"
+                "Complete the text under ### Context by first planning inside <think>...</think>, then writing the continuation.\n\n"
+                "Inside <think>, freely brainstorm how the rest of the solution might go in broad, big-picture terms.\n"
+                "The plan can be long and detailed (around 1000–2000 tokens) and may include, for example:\n"
+                "- A short reflection on what the context has already established.\n"
+                "- Recall of important mathematical concepts needed to understand the context.\n"
+                "- Several possible ways the solution or argument could continue or conclude.\n"
+                "- A comparison of these options using your mathematical knowledge and the given context.\n"
+                "- A coherent overall storyline for the rest of the text: major stages, subcases, important intermediate results, and the shape of the final answer.\n\n"
+                "Think of <think> as a space to explore alternatives, discard what doesn't fit, and settle on a sensible plan for how the document is likely to finish.\n\n"
+                "After </think>, write only the predicted continuation of the document in full prose, matching the style, notation, and level of detail of the context.\n"
+                "Do NOT include your reasoning there and do NOT repeat the context.\n"
+                "Enclose this continuation between <|startofprediction|> and <|endofprediction|>.\n\n"
+                f"### Context\n{context}\n\n"
+                f"<think>\n{thinking_text}\n</think>\n"
+                f"<|startofprediction|>\n{gold_remaining_solution}\n<|endofprediction|>"
+            )
+
+            # ===== CONSTRUCT BASELINE WITHOUT THINKING (Simplest Possible) =====
+            # Just: problem + partial_solution + gold_solution
+            # No instructions, no tags, cleanest baseline
+            if partial_solution_given.strip():
+                prompt_without_thinking = f"{problem}\n\n{partial_solution_given}\n\n{gold_remaining_solution}"
+            else:
+                prompt_without_thinking = f"{problem}\n\n{gold_remaining_solution}"
 
             # Apply chat template to both prompts
-            prompt_with_reasoning_chat = self.tokenizer.apply_chat_template(
-                [{"role": "user", "content": prompt_with_reasoning}],
+            prompt_with_thinking_chat = self.tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt_with_thinking}],
                 add_generation_prompt=False,  # We're measuring P(text), not generating
                 tokenize=False
             )
 
-            prompt_without_reasoning_chat = self.tokenizer.apply_chat_template(
-                [{"role": "user", "content": prompt_without_reasoning}],
+            prompt_without_thinking_chat = self.tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt_without_thinking}],
                 add_generation_prompt=False,
                 tokenize=False
             )
 
             # Tokenize both prompts
-            encoding_with = self.tokenizer(prompt_with_reasoning_chat, add_special_tokens=False, return_tensors="pt")
-            encoding_without = self.tokenizer(prompt_without_reasoning_chat, add_special_tokens=False, return_tensors="pt")
+            encoding_with = self.tokenizer(prompt_with_thinking_chat, add_special_tokens=False, return_tensors="pt")
+            encoding_without = self.tokenizer(prompt_without_thinking_chat, add_special_tokens=False, return_tensors="pt")
 
             ids_with = encoding_with["input_ids"][0]  # [L1]
             ids_without = encoding_without["input_ids"][0]  # [L2]
@@ -804,59 +814,59 @@ class RayPPOTrainer:
             pos_ids_without = compute_position_id_with_mask(mask_without_padded)
 
             # Append to lists
-            with_reasoning_input_ids.append(ids_with_padded[0])
-            with_reasoning_attention_mask.append(mask_with_padded[0])
-            with_reasoning_position_ids.append(pos_ids_with[0])
-            with_reasoning_response_mask.append(response_mask_with_padded)
+            with_thinking_input_ids.append(ids_with_padded[0])
+            with_thinking_attention_mask.append(mask_with_padded[0])
+            with_thinking_position_ids.append(pos_ids_with[0])
+            with_thinking_response_mask.append(response_mask_with_padded)
 
-            without_reasoning_input_ids.append(ids_without_padded[0])
-            without_reasoning_attention_mask.append(mask_without_padded[0])
-            without_reasoning_position_ids.append(pos_ids_without[0])
-            without_reasoning_response_mask.append(response_mask_without_padded)
+            without_thinking_input_ids.append(ids_without_padded[0])
+            without_thinking_attention_mask.append(mask_without_padded[0])
+            without_thinking_position_ids.append(pos_ids_without[0])
+            without_thinking_response_mask.append(response_mask_without_padded)
 
         # Stack all components
-        stacked_with_input_ids = torch.stack(with_reasoning_input_ids)
-        stacked_with_attention_mask = torch.stack(with_reasoning_attention_mask)
-        stacked_with_position_ids = torch.stack(with_reasoning_position_ids)
-        stacked_with_response_mask = torch.stack(with_reasoning_response_mask)
+        stacked_with_input_ids = torch.stack(with_thinking_input_ids)
+        stacked_with_attention_mask = torch.stack(with_thinking_attention_mask)
+        stacked_with_position_ids = torch.stack(with_thinking_position_ids)
+        stacked_with_response_mask = torch.stack(with_thinking_response_mask)
 
-        stacked_without_input_ids = torch.stack(without_reasoning_input_ids)
-        stacked_without_attention_mask = torch.stack(without_reasoning_attention_mask)
-        stacked_without_position_ids = torch.stack(without_reasoning_position_ids)
-        stacked_without_response_mask = torch.stack(without_reasoning_response_mask)
+        stacked_without_input_ids = torch.stack(without_thinking_input_ids)
+        stacked_without_attention_mask = torch.stack(without_thinking_attention_mask)
+        stacked_without_position_ids = torch.stack(without_thinking_position_ids)
+        stacked_without_response_mask = torch.stack(without_thinking_response_mask)
 
         # Extract "responses" by finding where response_mask == 1 in input_ids
-        # For "with reasoning" batch
-        with_reasoning_responses = []
+        # For "with thinking" batch
+        with_thinking_responses = []
         for i in range(batch_size):
             response_indices = (stacked_with_response_mask[i] == 1).nonzero(as_tuple=True)[0]
             response_tokens = stacked_with_input_ids[i][response_indices]
             # Pad to max response length in batch
-            with_reasoning_responses.append(response_tokens)
+            with_thinking_responses.append(response_tokens)
 
-        # For "without reasoning" batch
-        without_reasoning_responses = []
+        # For "without thinking" batch
+        without_thinking_responses = []
         for i in range(batch_size):
             response_indices = (stacked_without_response_mask[i] == 1).nonzero(as_tuple=True)[0]
             response_tokens = stacked_without_input_ids[i][response_indices]
-            without_reasoning_responses.append(response_tokens)
+            without_thinking_responses.append(response_tokens)
 
         # Pad responses to same length within each batch
-        max_response_len_with = max(len(r) for r in with_reasoning_responses)
-        max_response_len_without = max(len(r) for r in without_reasoning_responses)
+        max_response_len_with = max(len(r) for r in with_thinking_responses)
+        max_response_len_without = max(len(r) for r in without_thinking_responses)
 
         padded_responses_with = []
-        for r in with_reasoning_responses:
+        for r in with_thinking_responses:
             padded = torch.nn.functional.pad(r, (0, max_response_len_with - len(r)), value=self.tokenizer.pad_token_id)
             padded_responses_with.append(padded)
 
         padded_responses_without = []
-        for r in without_reasoning_responses:
+        for r in without_thinking_responses:
             padded = torch.nn.functional.pad(r, (0, max_response_len_without - len(r)), value=self.tokenizer.pad_token_id)
             padded_responses_without.append(padded)
 
-        # Create batch with reasoning
-        batch_with_reasoning_dict = {
+        # Create batch with thinking
+        batch_with_thinking_dict = {
             "input_ids": stacked_with_input_ids,
             "attention_mask": stacked_with_attention_mask,
             "position_ids": stacked_with_position_ids,
@@ -864,8 +874,8 @@ class RayPPOTrainer:
             "responses": torch.stack(padded_responses_with),  # [B, R]
         }
 
-        # Create batch without reasoning
-        batch_without_reasoning_dict = {
+        # Create batch without thinking
+        batch_without_thinking_dict = {
             "input_ids": stacked_without_input_ids,
             "attention_mask": stacked_without_attention_mask,
             "position_ids": stacked_without_position_ids,
@@ -873,13 +883,13 @@ class RayPPOTrainer:
             "responses": torch.stack(padded_responses_without),  # [B, R]
         }
 
-        batch_with_reasoning = DataProto.from_single_dict(batch_with_reasoning_dict)
-        batch_without_reasoning = DataProto.from_single_dict(batch_without_reasoning_dict)
+        batch_with_thinking = DataProto.from_single_dict(batch_with_thinking_dict)
+        batch_without_thinking = DataProto.from_single_dict(batch_without_thinking_dict)
 
-        batch_with_reasoning.meta_info = batch.meta_info.copy()
-        batch_without_reasoning.meta_info = batch.meta_info.copy()
+        batch_with_thinking.meta_info = batch.meta_info.copy()
+        batch_without_thinking.meta_info = batch.meta_info.copy()
 
-        return batch_with_reasoning, batch_without_reasoning
+        return batch_with_thinking, batch_without_thinking
 
     def _validate(self):
         data_source_lst = []
@@ -1528,6 +1538,11 @@ class RayPPOTrainer:
                             # Negative IG = reasoning hurts (confuses model)
                             information_gain_raw = sum_with_reasoning - sum_without_reasoning  # [B]
 
+                            # DEBUG: Print IG raw values for first 6 samples
+                            print(f"[IG DEBUG] Raw IG values (first 6): {information_gain_raw[:6].tolist()}")
+                            print(f"[IG DEBUG] sum_with_reasoning (first 6): {sum_with_reasoning[:6].tolist()}")
+                            print(f"[IG DEBUG] sum_without_reasoning (first 6): {sum_without_reasoning[:6].tolist()}")
+
                             # NORMALIZE INFORMATION GAIN to [-1, 1] range using batch statistics
                             # This prevents extremely large IG values from dominating the reward
                             ig_std = information_gain_raw.std() + 1e-8
@@ -1538,6 +1553,9 @@ class RayPPOTrainer:
 
                             # Use normalized IG as the primary metric
                             information_gain = information_gain_normalized  # [B], range: [-1, 1]
+
+                            # DEBUG: Print normalized IG
+                            print(f"[IG DEBUG] Normalized IG (first 6): {information_gain[:6].tolist()}")
 
                             # Store both raw and normalized IG in batch for analysis
                             batch.batch["information_gain_raw"] = information_gain_raw  # [B], raw values

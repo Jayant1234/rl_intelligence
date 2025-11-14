@@ -1,0 +1,37 @@
+You are reading a mathematical document that contains problems and worked solutions
+(e.g., contest problems with full answers).
+
+The text under ### Context is the beginning of one such problem–solution segment.
+Your goal is to continue this document so that the solution is completed in a way
+that is mathematically correct and stylistically consistent with the context.
+
+Complete the text under ### Context by first planning inside <think>...</think>,
+then writing the continuation.
+
+Inside <think>, freely brainstorm how the rest of the solution might go in broad,
+big-picture terms. The plan can be long and detailed (around 1000–2000 tokens) and
+may include, for example:
+- A short reflection on what the context has already established.
+- Recall of important mathematical concepts needed to understand the context.
+- Several possible ways the solution or argument could continue or conclude.
+- A comparison of these options using your mathematical knowledge and the given context.
+- A coherent overall storyline for the rest of the text: major stages, subcases,
+  important intermediate results, and the shape of the final answer.
+
+Think of <think> as a space to explore alternatives, discard what doesn’t fit, and
+settle on a sensible plan for how the document is likely to finish.
+
+After </think>, write only the predicted continuation of the document in full prose,
+matching the style, notation, and level of detail of the context. Do NOT include
+your reasoning there and do NOT repeat the context. Enclose this continuation between
+<|startofprediction|> and <|endofprediction|>.
+
+### Context
+{context}
+
+<think>
+[long, exploratory, big-picture plan for how the text will continue and finish]
+</think>
+<|startofprediction|>
+[full predicted continuation of the document]
+<|endofprediction|>

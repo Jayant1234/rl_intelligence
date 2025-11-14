@@ -131,51 +131,50 @@ def calculate_sentence_split(sentences: List[str], target_percentage: float) -> 
 
 def create_curriculum_prompt(problem: str, given_solution: str) -> str:
     """
-    Create the final prompt by combining problem and partial solution.
+    Create the final prompt using document continuation format.
+
+    This uses the new format with <think>...</think> and <|startofprediction|>...<|endofprediction|>
+    tags instead of the old **Reasoning:** / **Solution:** headers.
 
     Args:
         problem: The math problem statement
-        given_solution: The partial solution to include (can be empty)
+        given_solution: The partial solution to include (can be empty for 0% curriculum)
 
     Returns:
-        Formatted prompt string
+        Formatted prompt string in document continuation style
     """
+    # Build the context section (problem + partial solution if provided)
     if given_solution.strip():
-        # With partial solution: ask for reasoning first, then completion
-        prompt = (
-            f"{problem}\n\n"
-            f"A partial solution is provided below:\n\n"
-            f"{given_solution}\n\n"
-            f"Task: Complete this solution by following these steps in order.\n\n"
-            f"First, write your reasoning:\n"
-            f"- Explain what the partial solution has established\n"
-            f"- Identify what steps remain to be done\n\n"
-            f"Then, complete the remaining solution:\n"
-            f"- Show the remaining steps clearly\n"
-            f"- Put your final answer in \\boxed{{}}\n\n"
-            f"Format your response as:\n\n"
-            f"**Reasoning:**\n"
-            f"[Your understanding of the partial solution and plan for remaining steps]\n\n"
-            f"**Remaining Solution:**\n"
-            f"[Complete the remaining steps and final answer in \\boxed{{}}]"
-        )
+        context = f"{problem}\n\n{given_solution}"
     else:
-        # Without partial solution: ask for reasoning first, then full solution
-        prompt = (
-            f"{problem}\n\n"
-            f"Task: Solve this problem by following these steps in order.\n\n"
-            f"First, write your reasoning:\n"
-            f"- Break down the problem\n"
-            f"- Plan your solution approach\n\n"
-            f"Then, write your complete solution:\n"
-            f"- Show all steps clearly\n"
-            f"- Put your final answer in \\boxed{{}}\n\n"
-            f"Format your response as:\n\n"
-            f"**Reasoning:**\n"
-            f"[Your step-by-step reasoning and approach]\n\n"
-            f"**Solution:**\n"
-            f"[Complete solution with final answer in \\boxed{{}}]"
-        )
+        context = problem
+
+    # Create the full prompt with document continuation instructions
+    # This format is the same regardless of whether partial solution is provided
+    prompt = (
+        "You are reading a mathematical document that contains problems and worked solutions (e.g., contest problems with full answers).\n\n"
+        "The text under ### Context is the beginning of one such problem–solution segment.\n"
+        "Your goal is to continue this document so that the solution is completed in a way that is mathematically correct and stylistically consistent with the context.\n\n"
+        "Complete the text under ### Context by first planning inside <think>...</think>, then writing the continuation.\n\n"
+        "Inside <think>, freely brainstorm how the rest of the solution might go in broad, big-picture terms.\n"
+        "The plan can be long and detailed (around 1000–2000 tokens) and may include, for example:\n"
+        "- A short reflection on what the context has already established.\n"
+        "- Recall of important mathematical concepts needed to understand the context.\n"
+        "- Several possible ways the solution or argument could continue or conclude.\n"
+        "- A comparison of these options using your mathematical knowledge and the given context.\n"
+        "- A coherent overall storyline for the rest of the text: major stages, subcases, important intermediate results, and the shape of the final answer.\n\n"
+        "Think of <think> as a space to explore alternatives, discard what doesn't fit, and settle on a sensible plan for how the document is likely to finish.\n\n"
+        "After </think>, write only the predicted continuation of the document in full prose, matching the style, notation, and level of detail of the context.\n"
+        "Do NOT include your reasoning there and do NOT repeat the context.\n"
+        "Enclose this continuation between <|startofprediction|> and <|endofprediction|>.\n\n"
+        f"### Context\n{context}\n\n"
+        "<think>\n"
+        "[long, exploratory, big-picture plan for how the text will continue and finish]\n"
+        "</think>\n"
+        "<|startofprediction|>\n"
+        "[full predicted continuation of the document]\n"
+        "<|endofprediction|>"
+    )
 
     return prompt
 
