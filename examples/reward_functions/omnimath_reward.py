@@ -173,13 +173,7 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None):
     Compute reward combining Binary Information Gain + Binary Format Reward.
 
     This reward function combines:
-    1. Information Gain (IG - BINARIZED): Measures if thinking helps the model
-       IG = log P(answer | prompt + thinking) - log P(answer | prompt only)
-       BINARY THRESHOLD:
-       - If IG > 0: ig_reward = 1.0 (thinking helps)
-       - If IG ≤ 0: ig_reward = 0.0 (thinking doesn't help)
-
-    2. Format Reward (BINARY): Rewards proper document continuation structure
+    1. Format Reward (BINARY - CHECKED FIRST): Rewards proper document continuation structure
        Model must have ALL of the following to get format_reward=1.0:
        - Exactly one <think> opening tag
        - Exactly one </think> closing tag
@@ -191,9 +185,20 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None):
 
        If ANY check fails, format_reward=0.0 (all-or-nothing)
 
+    2. Information Gain (IG - BINARIZED, CONDITIONAL ON FORMAT): Measures if thinking helps
+       IG = log P(answer | prompt + thinking) - log P(answer | prompt only)
+       BINARY THRESHOLD:
+       - If IG > 0: ig_reward = 1.0 (thinking helps)
+       - If IG ≤ 0: ig_reward = 0.0 (thinking doesn't help)
+
+       CONDITIONAL ACTIVATION:
+       - If format_reward = 0: ig_reward = 0 (format must be learned first)
+       - If format_reward = 1: ig_reward = binary IG (reward good thinking)
+
     Final Reward Range: [-0.3, 1.3]
-       - Best: IG=1, format=1 → 1.3
-       - Worst: IG=0, format=0 → -0.3
+       - Best: format=1, IG>0 → 1.3 (perfect format + helpful thinking)
+       - Medium: format=1, IG≤0 → 0.3 (perfect format, thinking doesn't help)
+       - Worst: format=0 → -0.3 (bad format, IG ignored)
 
     Args:
         data_source (str): Dataset identifier (e.g., 'KbsdJames/Omni-MATH')
@@ -232,7 +237,16 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None):
             "warning": "information_gain not found in extra_info. Set compute_information_gain=True"
         }
 
-    # ===== COMPONENT 1: INFORMATION GAIN REWARD (BINARIZED) =====
+    # ===== COMPONENT 1: FORMAT REWARD (BINARY) - CHECKED FIRST =====
+
+    # Check if response follows the required document continuation format
+    # Note: has_partial_solution no longer needed - format is same regardless
+    format_scores = check_format_compliance(solution_str)
+
+    # Extract format metrics - now BINARY (0.0 or 1.0 only)
+    format_reward = format_scores["total_format_score"]  # Binary: 0.0 or 1.0
+
+    # ===== COMPONENT 2: INFORMATION GAIN REWARD (BINARIZED, CONDITIONAL ON FORMAT) =====
 
     # STRATEGY: Use Information Gain as primary reward signal
     # IG = log P(answer | prompt + thinking) - log P(answer | prompt only)
@@ -244,19 +258,18 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None):
     # - If IG > 0 (thinking helps): reward = +1
     # - If IG ≤ 0 (thinking hurts or neutral): reward = 0
     #
-    # Goal: Encourage thinking that provides positive information gain
+    # CONDITIONAL ACTIVATION: Only give IG reward if format is perfect
+    # - If format_reward = 0: ig_reward = 0 (format must be learned first)
+    # - If format_reward = 1: ig_reward = binary IG (reward good thinking)
+    #
+    # Goal: Model must first learn format, then learn good thinking
 
     # Binarize IG: positive → +1, negative/zero → 0
-    ig_reward = 1.0 if information_gain > 0 else 0.0
-
-    # ===== COMPONENT 2: FORMAT REWARD (BINARY) =====
-
-    # Check if response follows the required document continuation format
-    # Note: has_partial_solution no longer needed - format is same regardless
-    format_scores = check_format_compliance(solution_str)
-
-    # Extract format metrics - now BINARY (0.0 or 1.0 only)
-    format_reward = format_scores["total_format_score"]  # Binary: 0.0 or 1.0
+    # BUT only activate if format is perfect
+    if format_reward == 1.0:
+        ig_reward = 1.0 if information_gain > 0 else 0.0
+    else:
+        ig_reward = 0.0  # No IG reward if format is wrong
 
     # Scale format reward to match IG reward magnitude
     # Format reward is binary {0, 1}, scale to {-1, 1}
@@ -269,18 +282,19 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None):
     # With both IG and format binary, this controls format's contribution
     format_weight = 0.3
 
-    # Final combined reward: binary IG + weighted binary format
-    # Possible reward values:
-    # - IG=1, format=1: 1.0 + 0.3 = 1.3 (best: good thinking + correct format)
-    # - IG=1, format=0: 1.0 - 0.3 = 0.7 (good thinking, bad format)
-    # - IG=0, format=1: 0.0 + 0.3 = 0.3 (bad/neutral thinking, correct format)
-    # - IG=0, format=0: 0.0 - 0.3 = -0.3 (worst: bad thinking + bad format)
+    # Final combined reward: conditional binary IG + weighted binary format
+    # Possible reward values (with conditional IG):
+    # - format=1, IG>0: 1.0 + 0.3 = 1.3 (best: correct format + helpful thinking)
+    # - format=1, IG≤0: 0.0 + 0.3 = 0.3 (correct format, thinking doesn't help)
+    # - format=0: 0.0 - 0.3 = -0.3 (worst: bad format, IG forced to 0)
     final_reward = ig_reward + (format_weight * format_reward_scaled)
 
     # Note:
-    # - Binary IG creates clear signal: thinking either helps (1) or doesn't (0)
-    # - Format reward provides within-group variance for GRPO advantages
-    # - Negative rewards are possible when both IG and format fail
+    # - Conditional IG: Model must learn format BEFORE getting IG rewards
+    # - This creates curriculum: format first, then good thinking
+    # - Format reward provides clear signal: perfect format (0.3) vs bad format (-0.3)
+    # - IG reward adds bonus (+1.0) only when format is perfect AND thinking helps
+    # - GRPO advantages come from variance in IG (within format=1 group)
 
     # Return detailed dict for logging and analysis
     return {
