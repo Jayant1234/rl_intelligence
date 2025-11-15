@@ -133,8 +133,11 @@ def create_curriculum_prompt(problem: str, given_solution: str) -> str:
     """
     Create the final prompt using document continuation format.
 
-    This uses the new format with <think>...</think> and <|startofprediction|>...<|endofprediction|>
-    tags instead of the old **Reasoning:** / **Solution:** headers.
+    This uses the new simplified format with <think>...</think> and
+    <|startofprediction|>...<|endofprediction|> tags.
+
+    IMPORTANT: The prompt ends with "<think>\n" already started, so the model
+    just continues writing its thinking without needing to output the opening tag.
 
     Args:
         problem: The math problem statement
@@ -149,31 +152,22 @@ def create_curriculum_prompt(problem: str, given_solution: str) -> str:
     else:
         context = problem
 
-    # Create the full prompt with document continuation instructions
-    # This format is the same regardless of whether partial solution is provided
+    # Create the simplified prompt with <think> tag already started
     prompt = (
-        "You are reading a mathematical document that contains problems and worked solutions (e.g., contest problems with full answers).\n\n"
-        "The text under ### Context is the beginning of one such problem–solution segment.\n"
-        "Your goal is to continue this document so that the solution is completed in a way that is mathematically correct and stylistically consistent with the context.\n\n"
-        "Complete the text under ### Context by first planning inside <think>...</think>, then writing the continuation.\n\n"
-        "Inside <think>, freely brainstorm how the rest of the solution might go in broad, big-picture terms.\n"
-        "The plan can be long and detailed (around 1000–2000 tokens) and may include, for example:\n"
-        "- A short reflection on what the context has already established.\n"
-        "- Recall of important mathematical concepts needed to understand the context.\n"
-        "- Several possible ways the solution or argument could continue or conclude.\n"
-        "- A comparison of these options using your mathematical knowledge and the given context.\n"
-        "- A coherent overall storyline for the rest of the text: major stages, subcases, important intermediate results, and the shape of the final answer.\n\n"
-        "Think of <think> as a space to explore alternatives, discard what doesn't fit, and settle on a sensible plan for how the document is likely to finish.\n\n"
-        "After </think>, write only the predicted continuation of the document in full prose, matching the style, notation, and level of detail of the context.\n"
-        "Do NOT include your reasoning there and do NOT repeat the context.\n"
-        "Enclose this continuation between <|startofprediction|> and <|endofprediction|>.\n\n"
+        "You are reading a mathematical document that contains problems and fully worked solutions.\n\n"
+        "The text under ### Context is the beginning of one such solution, possibly cut off mid-argument.\n"
+        "Your task is to continue this solution so that the argument is completed in a way that is "
+        "mathematically correct and stylistically consistent with the context.\n\n"
+        "First, reason step by step between <think> and </think>. In <think>, you should:\n"
+        "- Understand what has already been proved in the Context.\n"
+        "- Figure out what the author is trying to do next.\n"
+        "- Plan how to continue from the last line to reach a clean conclusion.\n\n"
+        "After </think>, write only the predicted continuation of the document, starting "
+        "exactly from where the Context stops. Do NOT restate the problem and do NOT "
+        "summarize the context; just continue the solution in the same style.\n\n"
+        "Enclose this predicted continuation between <|startofprediction|> and <|endofprediction|>.\n\n"
         f"### Context\n{context}\n\n"
         "<think>\n"
-        "[long, exploratory, big-picture plan for how the text will continue and finish]\n"
-        "</think>\n"
-        "<|startofprediction|>\n"
-        "[full predicted continuation of the document]\n"
-        "<|endofprediction|>"
     )
 
     return prompt

@@ -605,16 +605,18 @@ class RayPPOTrainer:
         """
         Parse the generated response to extract thinking and prediction sections.
 
-        Expected format:
-            <think>
+        Expected format (NOTE: <think> is in the prompt, not in response):
             [thinking content]
             </think>
             <|startofprediction|>
             [prediction content]
             <|endofprediction|>
 
+        The opening <think> tag is provided in the prompt, so the response starts
+        with thinking content directly.
+
         Args:
-            response_text: Full generated response text
+            response_text: Full generated response text (does NOT include prompt)
             has_partial_solution: DEPRECATED - no longer used (format is same regardless)
 
         Returns:
@@ -622,21 +624,21 @@ class RayPPOTrainer:
         """
         import re
 
-        # Find <think> and </think> tags (case-sensitive)
-        think_open_match = re.search(r'<think>', response_text)
+        # Find </think> tag (case-sensitive)
+        # NOTE: We DON'T look for <think> since it's in the prompt
         think_close_match = re.search(r'</think>', response_text)
 
         # Find <|startofprediction|> and <|endofprediction|> tags (case-sensitive)
         prediction_open_match = re.search(r'<\|startofprediction\|>', response_text)
         prediction_close_match = re.search(r'<\|endofprediction\|>', response_text)
 
-        # Extract thinking content if tags exist
-        if think_open_match and think_close_match:
-            think_start = think_open_match.end()
+        # Extract thinking content from start of response to </think>
+        if think_close_match:
+            think_start = 0  # Response starts with thinking content
             think_end = think_close_match.start()
             thinking_text = response_text[think_start:think_end].strip()
         else:
-            # No valid thinking tags found - treat entire response as thinking
+            # No valid closing tag found - treat entire response as thinking
             thinking_text = response_text.strip()
 
         # Extract prediction content if tags exist
@@ -653,13 +655,15 @@ class RayPPOTrainer:
     def _construct_ig_batches_with_gold_solution(self, batch: DataProto) -> tuple[DataProto, DataProto]:
         """
         Construct two batches for Information Gain calculation:
-        1. Batch WITH thinking: Full doc continuation prompt + <think>thinking</think> + <|startofprediction|>gold_solution<|endofprediction|>
+        1. Batch WITH thinking: Simplified doc continuation prompt + <think>thinking</think> + <|startofprediction|>gold_solution<|endofprediction|>
         2. Batch WITHOUT thinking: Simple baseline = problem + partial_solution + gold_solution (no special formatting)
 
         IG formula:
         IG = log P(gold_solution | doc_format + thinking) - log P(gold_solution | simple_baseline)
 
         This measures: "Does our document continuation approach with thinking help compared to vanilla baseline?"
+
+        NOTE: The prompt uses the new simplified format (no placeholder text, concise instructions).
 
         Args:
             batch: Original batch with generated responses
@@ -707,23 +711,20 @@ class RayPPOTrainer:
             else:
                 context = problem
 
-            # ===== CONSTRUCT PROMPT WITH THINKING (Full Document Continuation Format) =====
+            # ===== CONSTRUCT PROMPT WITH THINKING (Simplified Document Continuation Format) =====
             prompt_with_thinking = (
-                "You are reading a mathematical document that contains problems and worked solutions (e.g., contest problems with full answers).\n\n"
-                "The text under ### Context is the beginning of one such problem–solution segment.\n"
-                "Your goal is to continue this document so that the solution is completed in a way that is mathematically correct and stylistically consistent with the context.\n\n"
-                "Complete the text under ### Context by first planning inside <think>...</think>, then writing the continuation.\n\n"
-                "Inside <think>, freely brainstorm how the rest of the solution might go in broad, big-picture terms.\n"
-                "The plan can be long and detailed (around 1000–2000 tokens) and may include, for example:\n"
-                "- A short reflection on what the context has already established.\n"
-                "- Recall of important mathematical concepts needed to understand the context.\n"
-                "- Several possible ways the solution or argument could continue or conclude.\n"
-                "- A comparison of these options using your mathematical knowledge and the given context.\n"
-                "- A coherent overall storyline for the rest of the text: major stages, subcases, important intermediate results, and the shape of the final answer.\n\n"
-                "Think of <think> as a space to explore alternatives, discard what doesn't fit, and settle on a sensible plan for how the document is likely to finish.\n\n"
-                "After </think>, write only the predicted continuation of the document in full prose, matching the style, notation, and level of detail of the context.\n"
-                "Do NOT include your reasoning there and do NOT repeat the context.\n"
-                "Enclose this continuation between <|startofprediction|> and <|endofprediction|>.\n\n"
+                "You are reading a mathematical document that contains problems and fully worked solutions.\n\n"
+                "The text under ### Context is the beginning of one such solution, possibly cut off mid-argument.\n"
+                "Your task is to continue this solution so that the argument is completed in a way that is "
+                "mathematically correct and stylistically consistent with the context.\n\n"
+                "First, reason step by step between <think> and </think>. In <think>, you should:\n"
+                "- Understand what has already been proved in the Context.\n"
+                "- Figure out what the author is trying to do next.\n"
+                "- Plan how to continue from the last line to reach a clean conclusion.\n\n"
+                "After </think>, write only the predicted continuation of the document, starting "
+                "exactly from where the Context stops. Do NOT restate the problem and do NOT "
+                "summarize the context; just continue the solution in the same style.\n\n"
+                "Enclose this predicted continuation between <|startofprediction|> and <|endofprediction|>.\n\n"
                 f"### Context\n{context}\n\n"
                 f"<think>\n{thinking_text}\n</think>\n"
                 f"<|startofprediction|>\n{gold_remaining_solution}\n<|endofprediction|>"
