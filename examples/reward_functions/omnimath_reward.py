@@ -271,10 +271,9 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None):
     else:
         ig_reward = 0.0  # No IG reward if format is wrong
 
-    # Scale format reward to match IG reward magnitude
-    # Format reward is binary {0, 1}, scale to {-1, 1}
-    # Give positive reward for perfect format, negative for any format failure
-    format_reward_scaled = (format_reward - 0.5) * 2.0  # Map {0, 1} to {-1, 1}
+    # No scaling needed - format reward is already binary {0, 1}
+    # Bad format gives 0, good format gives 1
+    format_reward_scaled = format_reward  # Binary: 0.0 or 1.0 (no scaling)
 
     # ===== COMBINE REWARDS =====
 
