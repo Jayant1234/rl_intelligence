@@ -656,14 +656,15 @@ class RayPPOTrainer:
         """
         Construct two batches for Information Gain calculation:
         1. Batch WITH thinking: Simplified doc continuation prompt + <think>thinking</think> + <|startofprediction|>gold_solution<|endofprediction|>
-        2. Batch WITHOUT thinking: Simple baseline = problem + partial_solution + gold_solution (no special formatting)
+        2. Batch WITHOUT thinking: Minimal baseline = "Solve the following math problem." + problem + partial_solution + gold_solution
 
         IG formula:
-        IG = log P(gold_solution | doc_format + thinking) - log P(gold_solution | simple_baseline)
+        IG = log P(gold_solution | doc_format + thinking) - log P(gold_solution | minimal_baseline)
 
-        This measures: "Does our document continuation approach with thinking help compared to vanilla baseline?"
+        This measures: "Does our document continuation approach with thinking help compared to simple instruction?"
 
-        NOTE: The prompt uses the new simplified format (no placeholder text, concise instructions).
+        NOTE: Baseline includes minimal instruction to follow DeepSeek/Qwen prompting best practices
+        (avoids artificially bad log probs from completely raw text).
 
         Args:
             batch: Original batch with generated responses
@@ -730,13 +731,22 @@ class RayPPOTrainer:
                 f"<|startofprediction|>\n{gold_remaining_solution}\n<|endofprediction|>"
             )
 
-            # ===== CONSTRUCT BASELINE WITHOUT THINKING (Simplest Possible) =====
-            # Just: problem + partial_solution + gold_solution
-            # No instructions, no tags, cleanest baseline
+            # ===== CONSTRUCT BASELINE WITHOUT THINKING (Simple Direct Instruction) =====
+            # Minimal baseline that follows DeepSeek/Qwen prompting best practices
+            # Simple instruction + problem context, no reasoning structure
             if partial_solution_given.strip():
-                prompt_without_thinking = f"{problem}\n\n{partial_solution_given}\n\n{gold_remaining_solution}"
+                prompt_without_thinking = (
+                    "Solve the following math problem.\n\n"
+                    f"{problem}\n\n"
+                    f"{partial_solution_given}\n\n"
+                    f"{gold_remaining_solution}"
+                )
             else:
-                prompt_without_thinking = f"{problem}\n\n{gold_remaining_solution}"
+                prompt_without_thinking = (
+                    "Solve the following math problem.\n\n"
+                    f"{problem}\n\n"
+                    f"{gold_remaining_solution}"
+                )
 
             # Apply chat template to both prompts
             prompt_with_thinking_chat = self.tokenizer.apply_chat_template(
