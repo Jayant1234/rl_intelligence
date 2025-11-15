@@ -195,10 +195,10 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None):
        - If format_reward = 0: ig_reward = 0 (format must be learned first)
        - If format_reward = 1: ig_reward = binary IG (reward good thinking)
 
-    Final Reward Range: [-0.3, 1.3]
+    Final Reward Range: [0.0, 1.3] (no negative rewards)
        - Best: format=1, IG>0 → 1.3 (perfect format + helpful thinking)
        - Medium: format=1, IG≤0 → 0.3 (perfect format, thinking doesn't help)
-       - Worst: format=0 → -0.3 (bad format, IG ignored)
+       - Worst: format=0 → 0.0 (bad format, IG ignored)
 
     Args:
         data_source (str): Dataset identifier (e.g., 'KbsdJames/Omni-MATH')
@@ -282,18 +282,19 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None):
     format_weight = 0.3
 
     # Final combined reward: conditional binary IG + weighted binary format
-    # Possible reward values (with conditional IG):
-    # - format=1, IG>0: 1.0 + 0.3 = 1.3 (best: correct format + helpful thinking)
-    # - format=1, IG≤0: 0.0 + 0.3 = 0.3 (correct format, thinking doesn't help)
-    # - format=0: 0.0 - 0.3 = -0.3 (worst: bad format, IG forced to 0)
+    # Possible reward values (with conditional IG, no negative rewards):
+    # - format=1, IG>0: 1.0 + 0.3*1 = 1.3 (best: correct format + helpful thinking)
+    # - format=1, IG≤0: 0.0 + 0.3*1 = 0.3 (correct format, thinking doesn't help)
+    # - format=0: 0.0 + 0.3*0 = 0.0 (worst: bad format, IG forced to 0)
     final_reward = ig_reward + (format_weight * format_reward_scaled)
 
     # Note:
     # - Conditional IG: Model must learn format BEFORE getting IG rewards
     # - This creates curriculum: format first, then good thinking
-    # - Format reward provides clear signal: perfect format (0.3) vs bad format (-0.3)
+    # - Format reward provides clear signal: perfect format (0.3) vs bad format (0.0)
     # - IG reward adds bonus (+1.0) only when format is perfect AND thinking helps
     # - GRPO advantages come from variance in IG (within format=1 group)
+    # - No negative rewards: worst case is 0.0, not negative
 
     # Return detailed dict for logging and analysis
     return {
@@ -306,7 +307,7 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None):
 
         # Format metrics (new tag-based format)
         "format_reward": float(format_reward),  # Binary: 0.0 or 1.0
-        "format_reward_scaled": float(format_reward_scaled),  # Binary: -1.0 or 1.0
+        "format_reward_scaled": float(format_reward_scaled),  # Binary: 0.0 or 1.0 (no scaling)
         "has_think_open": float(format_scores["has_think_open"]),
         "has_think_close": float(format_scores["has_think_close"]),
         "has_prediction_open": float(format_scores["has_prediction_open"]),
