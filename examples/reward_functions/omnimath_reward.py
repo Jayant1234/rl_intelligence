@@ -45,50 +45,41 @@ def check_format_compliance(response_text: str, has_partial_solution: bool = Non
 
     Tags are CASE-SENSITIVE and must be lowercase.
 
-    Expected format:
-        <think>
+    Expected format (NOTE: <think> is added by chat template, NOT checked):
         [thinking content - at least 100 chars]
         </think>
         <|startofprediction|>
         [continuation - at least 10 chars]
         <|endofprediction|>
 
-    The model must generate ALL tags including the opening <think> tag.
+    The chat template adds <think> after the assistant tag, so we DON'T check for it.
+    We only check that the model properly closes it and uses prediction tags.
 
     Args:
-        response_text: The model's generated response (does NOT include prompt)
+        response_text: The model's generated response (does NOT include prompt or chat template tags)
         has_partial_solution: DEPRECATED - no longer used (format is same regardless)
 
     Returns:
         dict with format compliance scores and breakdown
     """
     format_scores = {
-        "has_think_open": 0.0,
+        "has_think_open": 1.0,  # Always 1.0 since chat template adds it
         "has_think_close": 0.0,
         "has_prediction_open": 0.0,
         "has_prediction_close": 0.0,
         "correct_order": 0.0,
         "think_substantive": 0.0,
         "prediction_substantive": 0.0,
-        "think_open_count": 0,
+        "think_open_count": 0,  # Not checked (added by chat template)
         "think_close_count": 0,
         "prediction_open_count": 0,
         "prediction_close_count": 0,
         "total_format_score": 0.0,
     }
 
-    # Check for <think> opening tag - must appear EXACTLY ONCE (case-sensitive)
-    think_open_matches = list(re.finditer(r'<think>', response_text))
-    format_scores["think_open_count"] = len(think_open_matches)
-    if len(think_open_matches) == 1:
-        format_scores["has_think_open"] = 1.0
-        think_open_match = think_open_matches[0]
-    elif len(think_open_matches) > 1:
-        # Multiple occurrences - set total score to 0 and return immediately
-        format_scores["total_format_score"] = 0.0
-        return format_scores
-    else:
-        think_open_match = None
+    # NOTE: We DON'T check for <think> opening tag since chat template adds it
+    # Assume it exists at position 0 (added by chat template before response)
+    think_open_match = None  # Not checked
 
     # Check for </think> closing tag - must appear EXACTLY ONCE (case-sensitive)
     think_close_matches = list(re.finditer(r'</think>', response_text))
@@ -129,16 +120,17 @@ def check_format_compliance(response_text: str, has_partial_solution: bool = Non
     else:
         prediction_close_match = None
 
-    # Check correct order: <think> → </think> → <|startofprediction|> → <|endofprediction|>
-    if think_open_match and think_close_match and prediction_open_match and prediction_close_match:
-        if (think_open_match.start() < think_close_match.start() <
-            prediction_open_match.start() < prediction_close_match.start()):
+    # Check correct order: </think> → <|startofprediction|> → <|endofprediction|>
+    # (Note: <think> is in chat template at position 0, so we don't check it)
+    if think_close_match and prediction_open_match and prediction_close_match:
+        if (think_close_match.start() < prediction_open_match.start() < prediction_close_match.start()):
             format_scores["correct_order"] = 1.0
 
     # Check if think section is substantive (at least 100 chars)
-    if think_open_match and think_close_match:
-        think_start = think_open_match.end()  # After <think> tag
-        think_end = think_close_match.start()  # Before </think> tag
+    # Since <think> is in the chat template, thinking content is from start of response to </think>
+    if think_close_match:
+        think_start = 0  # Response starts with thinking content (after chat template's <think>)
+        think_end = think_close_match.start()
         think_content = response_text[think_start:think_end].strip()
 
         if len(think_content) >= 100:  # At least 100 characters
@@ -154,9 +146,9 @@ def check_format_compliance(response_text: str, has_partial_solution: bool = Non
             format_scores["prediction_substantive"] = 1.0
 
     # BINARY ALL-OR-NOTHING SCORING
-    # Model must pass ALL 7 checks to get format_score = 1.0
+    # Model must pass ALL 6 checks to get format_score = 1.0
+    # (Note: has_think_open is always 1.0 since chat template adds it, so we don't check it)
     all_checks_pass = all([
-        format_scores["has_think_open"] == 1.0,
         format_scores["has_think_close"] == 1.0,
         format_scores["has_prediction_open"] == 1.0,
         format_scores["has_prediction_close"] == 1.0,
@@ -177,15 +169,16 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None):
     This reward function combines:
     1. Format Reward (BINARY - CHECKED FIRST): Rewards proper document continuation structure
        Model must have ALL of the following to get format_reward=1.0:
-       - Exactly one <think> opening tag
-       - Exactly one </think> closing tag
+       - Exactly one </think> closing tag (opening tag added by chat template)
        - Exactly one <|startofprediction|> tag
        - Exactly one <|endofprediction|> tag
-       - Correct order: <think> → </think> → <|startofprediction|> → <|endofprediction|>
-       - Think section (between <think> tags) has ≥ 100 characters
+       - Correct order: </think> → <|startofprediction|> → <|endofprediction|>
+       - Think section (from start to </think>) has ≥ 100 characters
        - Prediction section (between prediction tags) has ≥ 10 characters
 
        If ANY check fails, format_reward=0.0 (all-or-nothing)
+
+       NOTE: The <think> opening tag is added by the chat template, so we don't check for it.
 
     2. Information Gain (IG - BINARIZED, CONDITIONAL ON GROUP FORMAT): Measures if thinking helps
        IG = log P(answer | prompt + thinking) - log P(answer | prompt only)
