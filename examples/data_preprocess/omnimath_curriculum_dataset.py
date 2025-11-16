@@ -136,8 +136,7 @@ def create_curriculum_prompt(problem: str, given_solution: str) -> str:
     This uses the new simplified format with <think>...</think> and
     <|startofprediction|>...<|endofprediction|> tags.
 
-    IMPORTANT: The prompt ends with "<think>\n" already started, so the model
-    just continues writing its thinking without needing to output the opening tag.
+    IMPORTANT: The model must generate ALL tags including the opening <think> tag.
 
     Args:
         problem: The math problem statement
@@ -152,7 +151,7 @@ def create_curriculum_prompt(problem: str, given_solution: str) -> str:
     else:
         context = problem
 
-    # Create the simplified prompt with <think> tag already started
+    # Create the simplified prompt without <think> tag (model must generate it)
     prompt = (
         "You are reading a mathematical document that contains problems and fully worked solutions.\n\n"
         "The text under ### Context is the beginning of one such solution, possibly cut off mid-argument.\n"
@@ -167,7 +166,6 @@ def create_curriculum_prompt(problem: str, given_solution: str) -> str:
         "summarize the context; just continue the solution in the same style.\n\n"
         "Enclose this predicted continuation between <|startofprediction|> and <|endofprediction|>.\n\n"
         f"### Context\n{context}\n\n"
-        "<think>\n"
     )
 
     return prompt

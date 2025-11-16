@@ -21,6 +21,7 @@ their log probabilities, giving us access to model outputs for reward calculatio
 
 import torch
 import numpy as np
+from collections import defaultdict
 from verl import DataProto
 
 
@@ -65,6 +66,7 @@ def compute_omnimath_curriculum_metrics(batch: DataProto, tokenizer) -> dict:
     decoded_responses = []
     partial_solutions = []
     remaining_solutions = []
+    format_scores_list = []  # Store format compliance results
 
     # Extract model outputs (these are already computed by the trainer)
     old_log_probs = batch.batch["old_log_probs"]  # Policy
@@ -73,8 +75,12 @@ def compute_omnimath_curriculum_metrics(batch: DataProto, tokenizer) -> dict:
     prompts = batch.batch["prompts"]
     attention_mask = batch.batch["attention_mask"]
 
+    # Extract group IDs (uid) for GRPO grouping
+    group_ids = batch.non_tensor_batch.get("uid", None)
+
     prompt_length = prompts.shape[-1]
 
+    # First pass: Decode responses and compute format compliance
     for i in range(batch_size):
         # ===== EXTRACT CURRICULUM DATA =====
         partial_given = batch.non_tensor_batch["reward_model"][i]["partial_solution_given"]
@@ -110,6 +116,47 @@ def compute_omnimath_curriculum_metrics(batch: DataProto, tokenizer) -> dict:
         else:
             kl_divergence.append(0.0)
 
+    # ===== COMPUTE GROUP-LEVEL FORMAT COMPLIANCE =====
+    # Check if ALL samples in each GRPO group have format_reward = 1.0
+    # This is used to gate IG rewards at the group level
+
+    group_format_status = defaultdict(list)  # group_id -> list of format scores
+
+    if group_ids is not None:
+        # Collect format scores by group
+        for i in range(batch_size):
+            group_id = group_ids[i]
+            # Get format score from extra_info if already computed, or check now
+            if "extra_info" in batch.non_tensor_batch and isinstance(batch.non_tensor_batch["extra_info"][i], dict):
+                # Format may have been checked elsewhere, get from extra_info
+                format_score = batch.non_tensor_batch["extra_info"][i].get("format_reward", None)
+                if format_score is None:
+                    # Need to check format compliance
+                    from examples.reward_functions.omnimath_reward import check_format_compliance
+                    format_result = check_format_compliance(decoded_responses[i])
+                    format_score = format_result["total_format_score"]
+            else:
+                # Check format compliance for this sample
+                from examples.reward_functions.omnimath_reward import check_format_compliance
+                format_result = check_format_compliance(decoded_responses[i])
+                format_score = format_result["total_format_score"]
+
+            group_format_status[group_id].append(format_score)
+
+        # Determine if ALL formats passed in each group
+        group_all_passed = {
+            gid: all(score == 1.0 for score in scores)
+            for gid, scores in group_format_status.items()
+        }
+
+        # Create per-sample array indicating if their group passed all formats
+        group_all_formats_passed = np.array([
+            group_all_passed[group_ids[i]] for i in range(batch_size)
+        ], dtype=bool)
+    else:
+        # No grouping (uid not available), assume all passed
+        group_all_formats_passed = np.ones(batch_size, dtype=bool)
+
     # Return as numpy arrays (compatible with batch.non_tensor_batch)
     return {
         "policy_confidence": np.array(policy_confidence, dtype=np.float32),
@@ -117,4 +164,5 @@ def compute_omnimath_curriculum_metrics(batch: DataProto, tokenizer) -> dict:
         "decoded_responses": np.array(decoded_responses, dtype=object),
         "partial_solution_given": np.array(partial_solutions, dtype=object),
         "remaining_solution": np.array(remaining_solutions, dtype=object),
+        "group_all_formats_passed": group_all_formats_passed,  # NEW: Group-level format gating
     }

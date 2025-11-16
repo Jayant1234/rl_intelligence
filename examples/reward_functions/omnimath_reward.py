@@ -45,15 +45,15 @@ def check_format_compliance(response_text: str, has_partial_solution: bool = Non
 
     Tags are CASE-SENSITIVE and must be lowercase.
 
-    Expected format (NOTE: <think> is in the prompt, not in response):
+    Expected format:
+        <think>
         [thinking content - at least 100 chars]
         </think>
         <|startofprediction|>
         [continuation - at least 10 chars]
         <|endofprediction|>
 
-    The opening <think> tag is provided in the prompt, so we DON'T check for it.
-    We only check that the model properly closes it and uses prediction tags.
+    The model must generate ALL tags including the opening <think> tag.
 
     Args:
         response_text: The model's generated response (does NOT include prompt)
@@ -63,23 +63,32 @@ def check_format_compliance(response_text: str, has_partial_solution: bool = Non
         dict with format compliance scores and breakdown
     """
     format_scores = {
-        "has_think_open": 1.0,  # Always 1.0 since <think> is in prompt
+        "has_think_open": 0.0,
         "has_think_close": 0.0,
         "has_prediction_open": 0.0,
         "has_prediction_close": 0.0,
         "correct_order": 0.0,
         "think_substantive": 0.0,
         "prediction_substantive": 0.0,
-        "think_open_count": 0,  # Not checked (in prompt)
+        "think_open_count": 0,
         "think_close_count": 0,
         "prediction_open_count": 0,
         "prediction_close_count": 0,
         "total_format_score": 0.0,
     }
 
-    # NOTE: We DON'T check for <think> opening tag since it's in the prompt
-    # Model starts generating directly after <think>\n in the prompt
-    think_open_match = None  # Assume it exists at position 0 in full text
+    # Check for <think> opening tag - must appear EXACTLY ONCE (case-sensitive)
+    think_open_matches = list(re.finditer(r'<think>', response_text))
+    format_scores["think_open_count"] = len(think_open_matches)
+    if len(think_open_matches) == 1:
+        format_scores["has_think_open"] = 1.0
+        think_open_match = think_open_matches[0]
+    elif len(think_open_matches) > 1:
+        # Multiple occurrences - set total score to 0 and return immediately
+        format_scores["total_format_score"] = 0.0
+        return format_scores
+    else:
+        think_open_match = None
 
     # Check for </think> closing tag - must appear EXACTLY ONCE (case-sensitive)
     think_close_matches = list(re.finditer(r'</think>', response_text))
@@ -120,17 +129,16 @@ def check_format_compliance(response_text: str, has_partial_solution: bool = Non
     else:
         prediction_close_match = None
 
-    # Check correct order: </think> → <|startofprediction|> → <|endofprediction|>
-    # (Note: <think> is in prompt at position 0, so we don't check it)
-    if think_close_match and prediction_open_match and prediction_close_match:
-        if (think_close_match.start() < prediction_open_match.start() < prediction_close_match.start()):
+    # Check correct order: <think> → </think> → <|startofprediction|> → <|endofprediction|>
+    if think_open_match and think_close_match and prediction_open_match and prediction_close_match:
+        if (think_open_match.start() < think_close_match.start() <
+            prediction_open_match.start() < prediction_close_match.start()):
             format_scores["correct_order"] = 1.0
 
     # Check if think section is substantive (at least 100 chars)
-    # Since <think> is in the prompt, thinking content is from start of response to </think>
-    if think_close_match:
-        think_start = 0  # Response starts with thinking content
-        think_end = think_close_match.start()
+    if think_open_match and think_close_match:
+        think_start = think_open_match.end()  # After <think> tag
+        think_end = think_close_match.start()  # Before </think> tag
         think_content = response_text[think_start:think_end].strip()
 
         if len(think_content) >= 100:  # At least 100 characters
@@ -146,9 +154,9 @@ def check_format_compliance(response_text: str, has_partial_solution: bool = Non
             format_scores["prediction_substantive"] = 1.0
 
     # BINARY ALL-OR-NOTHING SCORING
-    # Model must pass ALL 6 checks to get format_score = 1.0
-    # (Note: has_think_open is always 1.0 since <think> is in prompt, so we don't check it)
+    # Model must pass ALL 7 checks to get format_score = 1.0
     all_checks_pass = all([
+        format_scores["has_think_open"] == 1.0,
         format_scores["has_think_close"] == 1.0,
         format_scores["has_prediction_open"] == 1.0,
         format_scores["has_prediction_close"] == 1.0,
@@ -169,32 +177,31 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None):
     This reward function combines:
     1. Format Reward (BINARY - CHECKED FIRST): Rewards proper document continuation structure
        Model must have ALL of the following to get format_reward=1.0:
-       - Exactly one </think> closing tag (opening tag is in prompt)
+       - Exactly one <think> opening tag
+       - Exactly one </think> closing tag
        - Exactly one <|startofprediction|> tag
        - Exactly one <|endofprediction|> tag
-       - Correct order: </think> → <|startofprediction|> → <|endofprediction|>
-       - Think section (start of response to </think>) has ≥ 100 characters
+       - Correct order: <think> → </think> → <|startofprediction|> → <|endofprediction|>
+       - Think section (between <think> tags) has ≥ 100 characters
        - Prediction section (between prediction tags) has ≥ 10 characters
 
        If ANY check fails, format_reward=0.0 (all-or-nothing)
 
-       NOTE: The prompt now ends with "<think>\n" already started, so the model
-       doesn't need to output the opening tag.
-
-    2. Information Gain (IG - BINARIZED, CONDITIONAL ON FORMAT): Measures if thinking helps
+    2. Information Gain (IG - BINARIZED, CONDITIONAL ON GROUP FORMAT): Measures if thinking helps
        IG = log P(answer | prompt + thinking) - log P(answer | prompt only)
        BINARY THRESHOLD:
-       - If IG > 0: ig_reward = 1.0 (thinking helps)
-       - If IG ≤ 0: ig_reward = 0.0 (thinking doesn't help)
+       - If IG > 0.5 AND raw_IG > 0: ig_reward = 1.0 (thinking helps significantly)
+       - Otherwise: ig_reward = 0.0 (thinking doesn't help enough)
 
-       CONDITIONAL ACTIVATION:
-       - If format_reward = 0: ig_reward = 0 (format must be learned first)
-       - If format_reward = 1: ig_reward = binary IG (reward good thinking)
+       CONDITIONAL ACTIVATION (GROUP-LEVEL):
+       - If format_reward = 0: ig_reward = 0 (individual format failed)
+       - If ANY sample in GRPO group has format_reward = 0: ig_reward = 0 for ALL in group
+       - If format_reward = 1 AND all group formats passed: ig_reward = binary IG (reward good thinking)
 
     Final Reward Range: [0.0, 1.3] (no negative rewards)
-       - Best: format=1, IG>0 → 1.3 (perfect format + helpful thinking)
-       - Medium: format=1, IG≤0 → 0.3 (perfect format, thinking doesn't help)
-       - Worst: format=0 → 0.0 (bad format, IG ignored)
+       - Best: format=1, group_all_passed, IG>0.5, raw_IG>0 → 1.3 (perfect format + top thinking)
+       - Medium: format=1, group_all_passed, IG≤0.5 or raw_IG≤0 → 0.3 (perfect format, thinking not top tier)
+       - Worst: format=0 OR group has format failure → 0.0 (bad format or group contamination)
 
     Args:
         data_source (str): Dataset identifier (e.g., 'KbsdJames/Omni-MATH')
@@ -250,22 +257,31 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None):
     # The IG is NORMALIZED to [-1, 1] range using batch-level statistics:
     # normalized_IG = tanh((raw_IG - batch_mean) / batch_std)
     #
-    # BINARIZATION: Threshold at 0
-    # - If IG > 0 (thinking helps): reward = +1
-    # - If IG ≤ 0 (thinking hurts or neutral): reward = 0
+    # BINARIZATION: Threshold at 0.5 (top performers)
+    # - If IG > 0.5 AND raw_IG > 0 (thinking helps significantly): reward = +1
+    # - Otherwise: reward = 0
     #
-    # CONDITIONAL ACTIVATION: Only give IG reward if format is perfect
+    # CONDITIONAL ACTIVATION (GROUP-LEVEL): Only give IG reward if ALL samples in the
+    # GRPO group have perfect format
     # - If format_reward = 0: ig_reward = 0 (format must be learned first)
-    # - If format_reward = 1: ig_reward = binary IG (reward good thinking)
+    # - If group has ANY format failure: ig_reward = 0 for ALL in group
+    # - If format_reward = 1 AND group_all_formats_passed: ig_reward = binary IG (reward good thinking)
     #
-    # Goal: Model must first learn format, then learn good thinking
+    # Goal: Model must first learn format (group-level), then learn good thinking
 
-    # Binarize IG: positive → +1, negative/zero → 0
-    # BUT only activate if format is perfect
-    if format_reward == 1.0:
-        ig_reward = 1.0 if information_gain > 0 else 0.0
+    # Get group-level format status
+    group_all_formats_passed = extra_info.get("group_all_formats_passed", True)
+
+    # Binarize IG: only reward top performers with truly helpful thinking
+    # Requires:
+    # 1. Individual format is perfect (format_reward = 1.0)
+    # 2. ALL formats in the group are perfect (group_all_formats_passed = True)
+    # 3. Normalized IG > 0.5 (top ~30% of batch, significantly helpful)
+    # 4. Raw IG > 0 (thinking actually helps, not just relatively better)
+    if format_reward == 1.0 and group_all_formats_passed:
+        ig_reward = 1.0 if (information_gain > 0.5 and information_gain_raw > 0) else 0.0
     else:
-        ig_reward = 0.0  # No IG reward if format is wrong
+        ig_reward = 0.0  # No IG reward if format wrong or group has any format failure
 
     # No scaling needed - format reward is already binary {0, 1}
     # Bad format gives 0, good format gives 1
@@ -285,12 +301,17 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None):
     final_reward = ig_reward + (format_weight * format_reward_scaled)
 
     # Note:
-    # - Conditional IG: Model must learn format BEFORE getting IG rewards
-    # - This creates curriculum: format first, then good thinking
+    # - Conditional IG (GROUP-LEVEL): Model must learn format for ENTIRE GROUP before getting IG rewards
+    # - This creates curriculum: format first (all in group), then good thinking
     # - Format reward provides clear signal: perfect format (0.3) vs bad format (0.0)
-    # - IG reward adds bonus (+1.0) only when format is perfect AND thinking helps
-    # - GRPO advantages come from variance in IG (within format=1 group)
+    # - IG reward adds bonus (+1.0) only when:
+    #   1. Individual format is perfect (format_reward = 1.0)
+    #   2. ALL group members have perfect format (group_all_formats_passed = True)
+    #   3. Thinking is significantly helpful (IG > 0.5, top ~30% of batch)
+    #   4. Thinking actually helps (raw_IG > 0, not just relatively better)
+    # - GRPO advantages come from variance in IG (within format=1 groups that fully passed)
     # - No negative rewards: worst case is 0.0, not negative
+    # - Group-level gating prevents format failures from contaminating IG learning
 
     # Return detailed dict for logging and analysis
     return {
@@ -320,6 +341,9 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None):
         "solution_percentage": float(solution_percentage),
         "partial_given_len": len(partial_given),
         "remaining_sol_len": len(remaining_sol),
+
+        # Group-level format gating (NEW)
+        "group_all_formats_passed": bool(group_all_formats_passed),
 
         # Optional metrics (may be None if not computed)
         "policy_confidence": float(policy_confidence) if policy_confidence is not None else None,

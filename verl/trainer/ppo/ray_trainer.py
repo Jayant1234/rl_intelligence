@@ -1602,6 +1602,67 @@ class RayPPOTrainer:
                             metrics.update(ig_metrics)
                     # ===== END INFORMATION GAIN =====
 
+                    # ===== COMPUTE CUSTOM CURRICULUM METRICS =====
+                    # This is called AFTER IG computation but BEFORE reward computation
+                    # Results are injected into batch.non_tensor_batch["extra_info"] for reward function
+                    if self.config.get("custom_curriculum_metrics"):
+                        with marked_timer("curriculum_metrics", timing_raw, color="magenta"):
+                            curriculum_metrics_config = self.config.custom_curriculum_metrics
+
+                            # Load the custom metrics function (same pattern as custom reward function)
+                            if not hasattr(self, "_curriculum_metrics_fn"):
+                                import sys
+                                import os
+                                from importlib.util import spec_from_file_location, module_from_spec
+
+                                file_path = curriculum_metrics_config.get("path")
+                                function_name = curriculum_metrics_config.get("name")
+
+                                if file_path and function_name:
+                                    module_name = "custom_curriculum_metrics_module"
+                                    module = sys.modules.get(module_name, None)
+
+                                    if module is None:
+                                        if not os.path.exists(file_path):
+                                            raise FileNotFoundError(f"Curriculum metrics file not found: {file_path}")
+
+                                        spec = spec_from_file_location(module_name, file_path)
+                                        module = module_from_spec(spec)
+                                        sys.modules[module_name] = module
+                                        spec.loader.exec_module(module)
+
+                                    self._curriculum_metrics_fn = getattr(module, function_name)
+                                else:
+                                    self._curriculum_metrics_fn = None
+
+                            # Call the curriculum metrics function
+                            if hasattr(self, "_curriculum_metrics_fn") and self._curriculum_metrics_fn is not None:
+                                curriculum_metrics_dict = self._curriculum_metrics_fn(batch, self.tokenizer)
+
+                                # Inject results into batch.non_tensor_batch["extra_info"]
+                                # Deep copy extra_info if it exists to avoid shared references
+                                import copy
+                                if "extra_info" not in batch.non_tensor_batch:
+                                    extra_info_list = [{} for _ in range(len(batch))]
+                                elif isinstance(batch.non_tensor_batch["extra_info"], np.ndarray):
+                                    extra_info_list = [copy.deepcopy(item) if isinstance(item, dict) else {}
+                                                       for item in batch.non_tensor_batch["extra_info"]]
+                                else:
+                                    extra_info_list = [copy.deepcopy(item) if isinstance(item, dict) else {}
+                                                       for item in batch.non_tensor_batch["extra_info"]]
+
+                                # Merge curriculum metrics into each sample's extra_info
+                                for key, values in curriculum_metrics_dict.items():
+                                    if len(values) == len(batch):
+                                        for i in range(len(batch)):
+                                            if not isinstance(extra_info_list[i], dict):
+                                                extra_info_list[i] = {}
+                                            extra_info_list[i][key] = values[i]
+
+                                # Update batch with merged extra_info
+                                batch.non_tensor_batch["extra_info"] = np.array(extra_info_list, dtype=object)
+                    # ===== END CUSTOM CURRICULUM METRICS =====
+
                     # ===== COMPUTE REWARD =====
                     # Reward computation moved here (after information gain) so reward function can access IG
                     with marked_timer("reward", timing_raw, color="yellow"):
