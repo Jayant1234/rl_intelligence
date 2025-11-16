@@ -1695,7 +1695,7 @@ class RayPPOTrainer:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
                             # Aggregate format reward metrics for logging
-                            # Note: IG metrics are already logged separately at lines 1573-1583
+                            # Note: IG metrics (raw and normalized) are already logged separately at lines 1590-1602
                             format_metric_keys = [
                                 "format_reward", "format_reward_scaled",
                                 "has_reasoning_header", "has_solution_header", "has_boxed_answer",
@@ -1718,6 +1718,19 @@ class RayPPOTrainer:
                                             format_metrics[f"format/{key}_max"] = float(np.max(values_array))
 
                             metrics.update(format_metrics)
+
+                            # Aggregate IG reward metrics (final binary reward after all gating)
+                            if "ig_reward" in reward_extra_infos_dict:
+                                ig_reward_values = reward_extra_infos_dict["ig_reward"]
+                                if ig_reward_values and isinstance(ig_reward_values[0], (int, float, np.integer, np.floating)):
+                                    ig_reward_array = np.array(ig_reward_values, dtype=np.float32)
+                                    ig_reward_metrics = {
+                                        "curriculum/information_gain_reward_mean": float(np.mean(ig_reward_array)),
+                                        "curriculum/information_gain_reward_std": float(np.std(ig_reward_array)),
+                                        "curriculum/information_gain_reward_min": float(np.min(ig_reward_array)),
+                                        "curriculum/information_gain_reward_max": float(np.max(ig_reward_array)),
+                                    }
+                                    metrics.update(ig_reward_metrics)
 
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
