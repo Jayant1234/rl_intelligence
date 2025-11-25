@@ -164,7 +164,7 @@ def check_format_compliance(response_text: str, has_partial_solution: bool = Non
 
 def compute_score(data_source, solution_str, ground_truth, extra_info=None):
     """
-    Compute reward combining Binary Information Gain + Binary Format Reward.
+    Compute reward combining Continuous Information Gain + Binary Format Reward.
 
     This reward function combines:
     1. Format Reward (BINARY - CHECKED FIRST): Rewards proper document continuation structure
@@ -180,21 +180,24 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None):
 
        NOTE: The <think> opening tag is added by the chat template, so we don't check for it.
 
-    2. Information Gain (IG - BINARIZED, CONDITIONAL ON GROUP FORMAT): Measures if thinking helps
+    2. Information Gain (IG - CONTINUOUS, CONDITIONAL ON GROUP FORMAT & VARIANCE): Measures if thinking helps
        IG = log P(answer | prompt + thinking) - log P(answer | prompt only)
-       BINARY THRESHOLD:
-       - If IG > 0.5 AND raw_IG > 0: ig_reward = 1.0 (thinking helps significantly)
-       - Otherwise: ig_reward = 0.0 (thinking doesn't help enough)
+       CONTINUOUS REWARD: Uses normalized_IG directly (range: [-1, 1])
+       - Better thinking → higher IG reward
+       - Worse thinking → lower IG reward (can be negative)
 
-       CONDITIONAL ACTIVATION (GROUP-LEVEL):
+       CONDITIONAL ACTIVATION (GROUP-LEVEL - 4 CONDITIONS):
        - If format_reward = 0: ig_reward = 0 (individual format failed)
        - If ANY sample in GRPO group has format_reward = 0: ig_reward = 0 for ALL in group
-       - If format_reward = 1 AND all group formats passed: ig_reward = binary IG (reward good thinking)
+       - If group IG range < 100: ig_reward = 0 (insufficient variance for GRPO)
+       - If group max IG ≤ 0: ig_reward = 0 (no good examples in group)
+       - If ALL conditions met: ig_reward = normalized_IG (continuous learning)
 
-    Final Reward Range: [0.0, 1.3] (no negative rewards)
-       - Best: format=1, group_all_passed, IG>0.5, raw_IG>0 → 1.3 (perfect format + top thinking)
-       - Medium: format=1, group_all_passed, IG≤0.5 or raw_IG≤0 → 0.3 (perfect format, thinking not top tier)
-       - Worst: format=0 OR group has format failure → 0.0 (bad format or group contamination)
+    Final Reward Range: [-0.7, 1.3] (negative rewards possible after passing all gates)
+       - Best: format=1, all gates pass, IG=+1.0 → 1.3 (perfect format + excellent thinking)
+       - Medium: format=1, all gates pass, IG=0.0 → 0.3 (perfect format + neutral thinking)
+       - Low: format=1, all gates pass, IG=-1.0 → -0.7 (perfect format + harmful thinking)
+       - Worst: format=0 OR any gate fails → 0.0 (must learn format first)
 
     Args:
         data_source (str): Dataset identifier (e.g., 'KbsdJames/Omni-MATH')
@@ -242,7 +245,7 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None):
     # Extract format metrics - now BINARY (0.0 or 1.0 only)
     format_reward = format_scores["total_format_score"]  # Binary: 0.0 or 1.0
 
-    # ===== COMPONENT 2: INFORMATION GAIN REWARD (BINARIZED, CONDITIONAL ON FORMAT) =====
+    # ===== COMPONENT 2: INFORMATION GAIN REWARD (CONTINUOUS, CONDITIONAL ON FORMAT & VARIANCE) =====
 
     # STRATEGY: Use Information Gain as primary reward signal
     # IG = log P(answer | prompt + thinking) - log P(answer | prompt only)
@@ -250,31 +253,41 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None):
     # The IG is NORMALIZED to [-1, 1] range using batch-level statistics:
     # normalized_IG = tanh((raw_IG - batch_mean) / batch_std)
     #
-    # BINARIZATION: Threshold at 0.5 (top performers)
-    # - If IG > 0.5 AND raw_IG > 0 (thinking helps significantly): reward = +1
-    # - Otherwise: reward = 0
+    # CONTINUOUS REWARD: Use normalized_IG directly (no binarization)
+    # - This allows GRPO to learn from the continuous variance in thinking quality
+    # - Better thinking gets higher rewards, worse thinking gets lower rewards
     #
-    # CONDITIONAL ACTIVATION (GROUP-LEVEL): Only give IG reward if ALL samples in the
-    # GRPO group have perfect format
-    # - If format_reward = 0: ig_reward = 0 (format must be learned first)
-    # - If group has ANY format failure: ig_reward = 0 for ALL in group
-    # - If format_reward = 1 AND group_all_formats_passed: ig_reward = binary IG (reward good thinking)
+    # CONDITIONAL ACTIVATION (GROUP-LEVEL): Only give IG reward if:
+    # 1. All samples in the GRPO group have perfect format
+    # 2. Group has sufficient IG variance (range >= 100)
+    # 3. Group has at least one positive IG (max > 0)
     #
-    # Goal: Model must first learn format (group-level), then learn good thinking
+    # Conditions explained:
+    # - format_reward = 1: Individual format must be perfect (format must be learned first)
+    # - group_all_formats_passed = True: ALL group members have perfect format (no contamination)
+    # - group_ig_range_sufficient = True: Group has range(raw_IG) >= 100 (meaningful variance for GRPO)
+    # - group_max_ig_positive = True: Group has at least one IG > 0 (at least one good example)
+    #
+    # Goal: Model learns format first (group-level), then learns from continuous IG variance
 
-    # Get group-level format status
+    # Get group-level gating conditions
     group_all_formats_passed = extra_info.get("group_all_formats_passed", True)
+    group_ig_range_sufficient = extra_info.get("group_ig_range_sufficient", True)
+    group_max_ig_positive = extra_info.get("group_max_ig_positive", True)
 
-    # Binarize IG: only reward top performers with truly helpful thinking
+    # Use continuous IG reward when all conditions are met
     # Requires:
     # 1. Individual format is perfect (format_reward = 1.0)
     # 2. ALL formats in the group are perfect (group_all_formats_passed = True)
-    # 3. Normalized IG > 0.5 (top ~30% of batch, significantly helpful)
-    # 4. Raw IG > 0 (thinking actually helps, not just relatively better)
-    if format_reward == 1.0 and group_all_formats_passed:
-        ig_reward = 1.0 if (information_gain > 0.5 and information_gain_raw > 0) else 0.0
+    # 3. Group has sufficient IG variance (group_ig_range_sufficient = True, range >= 100)
+    # 4. Group has at least one positive IG (group_max_ig_positive = True, max > 0)
+    if (format_reward == 1.0 and
+        group_all_formats_passed and
+        group_ig_range_sufficient and
+        group_max_ig_positive):
+        ig_reward = information_gain  # Use continuous normalized IG [-1, 1]
     else:
-        ig_reward = 0.0  # No IG reward if format wrong or group has any format failure
+        ig_reward = 0.0  # No IG reward if any condition fails
 
     # No scaling needed - format reward is already binary {0, 1}
     # Bad format gives 0, good format gives 1
@@ -283,28 +296,30 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None):
     # ===== COMBINE REWARDS =====
 
     # Weight for format reward (adjust based on importance)
-    # With both IG and format binary, this controls format's contribution
+    # Format is binary, IG is continuous, this controls format's contribution
     format_weight = 0.3
 
-    # Final combined reward: conditional binary IG + weighted binary format
-    # Possible reward values (with conditional IG, no negative rewards):
-    # - format=1, IG>0: 1.0 + 0.3*1 = 1.3 (best: correct format + helpful thinking)
-    # - format=1, IG≤0: 0.0 + 0.3*1 = 0.3 (correct format, thinking doesn't help)
-    # - format=0: 0.0 + 0.3*0 = 0.0 (worst: bad format, IG forced to 0)
+    # Final combined reward: continuous IG + weighted binary format
+    # Reward range when conditions met (format=1, all group checks pass):
+    # - Best case: IG=+1.0 (top thinking) → 1.0 + 0.3 = 1.3
+    # - Medium case: IG=0.0 (neutral thinking) → 0.0 + 0.3 = 0.3
+    # - Worst case: IG=-1.0 (harmful thinking) → -1.0 + 0.3 = -0.7
+    # Reward when conditions fail (format=0 OR group checks fail):
+    # - All cases: IG forced to 0 → 0.0 + 0.0 = 0.0
     final_reward = ig_reward + (format_weight * format_reward_scaled)
 
     # Note:
-    # - Conditional IG (GROUP-LEVEL): Model must learn format for ENTIRE GROUP before getting IG rewards
-    # - This creates curriculum: format first (all in group), then good thinking
-    # - Format reward provides clear signal: perfect format (0.3) vs bad format (0.0)
-    # - IG reward adds bonus (+1.0) only when:
+    # - Conditional IG (GROUP-LEVEL): Model must meet ALL conditions before getting IG rewards:
     #   1. Individual format is perfect (format_reward = 1.0)
     #   2. ALL group members have perfect format (group_all_formats_passed = True)
-    #   3. Thinking is significantly helpful (IG > 0.5, top ~30% of batch)
-    #   4. Thinking actually helps (raw_IG > 0, not just relatively better)
-    # - GRPO advantages come from variance in IG (within format=1 groups that fully passed)
-    # - No negative rewards: worst case is 0.0, not negative
-    # - Group-level gating prevents format failures from contaminating IG learning
+    #   3. Group has sufficient IG variance (group_ig_range_sufficient = True, range >= 100)
+    #   4. Group has at least one positive IG (group_max_ig_positive = True, max > 0)
+    # - This creates curriculum: format first (all in group), then learn from IG variance
+    # - Format reward provides clear signal: perfect format (0.3) vs bad format (0.0)
+    # - IG reward is CONTINUOUS (normalized_IG in [-1, 1]) when conditions met
+    # - GRPO learns from the continuous variance in thinking quality within qualified groups
+    # - Negative IG rewards are possible (when thinking hurts), but only after passing all gates
+    # - Group-level gating ensures format is learned first and variance is meaningful
 
     # Return detailed dict for logging and analysis
     return {
@@ -335,8 +350,10 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None):
         "partial_given_len": len(partial_given),
         "remaining_sol_len": len(remaining_sol),
 
-        # Group-level format gating (NEW)
+        # Group-level gating conditions
         "group_all_formats_passed": bool(group_all_formats_passed),
+        "group_ig_range_sufficient": bool(group_ig_range_sufficient),
+        "group_max_ig_positive": bool(group_max_ig_positive),
 
         # Optional metrics (may be None if not computed)
         "policy_confidence": float(policy_confidence) if policy_confidence is not None else None,

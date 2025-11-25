@@ -157,6 +157,56 @@ def compute_omnimath_curriculum_metrics(batch: DataProto, tokenizer) -> dict:
         # No grouping (uid not available), assume all passed
         group_all_formats_passed = np.ones(batch_size, dtype=bool)
 
+    # ===== COMPUTE GROUP-LEVEL IG VARIANCE STATISTICS =====
+    # Check if each GRPO group has sufficient variance in IG scores
+    # This ensures GRPO can learn from meaningful differences in thinking quality
+
+    group_ig_range_sufficient = np.ones(batch_size, dtype=bool)  # Default: True
+    group_max_ig_positive = np.ones(batch_size, dtype=bool)  # Default: True
+
+    if group_ids is not None:
+        # Extract raw IG values from extra_info (should be populated by IG computation step)
+        raw_ig_values = []
+        for i in range(batch_size):
+            if "extra_info" in batch.non_tensor_batch and isinstance(batch.non_tensor_batch["extra_info"][i], dict):
+                raw_ig = batch.non_tensor_batch["extra_info"][i].get("information_gain_raw", None)
+                if raw_ig is not None:
+                    raw_ig_values.append(float(raw_ig))
+                else:
+                    raw_ig_values.append(0.0)  # Fallback if not computed
+            else:
+                raw_ig_values.append(0.0)  # Fallback if extra_info not available
+
+        # Group raw IG values by group_id
+        group_ig_values = defaultdict(list)
+        for i in range(batch_size):
+            group_id = group_ids[i]
+            group_ig_values[group_id].append(raw_ig_values[i])
+
+        # Compute statistics for each group
+        group_ig_stats = {}
+        for gid, ig_vals in group_ig_values.items():
+            ig_min = min(ig_vals)
+            ig_max = max(ig_vals)
+            ig_range = ig_max - ig_min
+
+            group_ig_stats[gid] = {
+                "min": ig_min,
+                "max": ig_max,
+                "range": ig_range,
+                "range_sufficient": ig_range >= 100.0,  # Require range >= 100
+                "max_positive": ig_max > 0.0,  # Require at least one positive IG
+            }
+
+        # Create per-sample arrays indicating if their group meets IG variance criteria
+        group_ig_range_sufficient = np.array([
+            group_ig_stats[group_ids[i]]["range_sufficient"] for i in range(batch_size)
+        ], dtype=bool)
+
+        group_max_ig_positive = np.array([
+            group_ig_stats[group_ids[i]]["max_positive"] for i in range(batch_size)
+        ], dtype=bool)
+
     # Return as numpy arrays (compatible with batch.non_tensor_batch)
     return {
         "policy_confidence": np.array(policy_confidence, dtype=np.float32),
@@ -164,5 +214,7 @@ def compute_omnimath_curriculum_metrics(batch: DataProto, tokenizer) -> dict:
         "decoded_responses": np.array(decoded_responses, dtype=object),
         "partial_solution_given": np.array(partial_solutions, dtype=object),
         "remaining_solution": np.array(remaining_solutions, dtype=object),
-        "group_all_formats_passed": group_all_formats_passed,  # NEW: Group-level format gating
+        "group_all_formats_passed": group_all_formats_passed,  # Group-level format gating
+        "group_ig_range_sufficient": group_ig_range_sufficient,  # NEW: Group has IG range >= 100
+        "group_max_ig_positive": group_max_ig_positive,  # NEW: Group has at least one IG > 0
     }
