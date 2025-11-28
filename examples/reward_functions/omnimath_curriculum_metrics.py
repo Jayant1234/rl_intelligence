@@ -158,10 +158,9 @@ def compute_omnimath_curriculum_metrics(batch: DataProto, tokenizer) -> dict:
         group_all_formats_passed = np.ones(batch_size, dtype=bool)
 
     # ===== COMPUTE GROUP-LEVEL IG VARIANCE STATISTICS =====
-    # Check if each GRPO group has sufficient variance in IG scores
-    # This ensures GRPO can learn from meaningful differences in thinking quality
+    # Check if each GRPO group has at least one positive IG
+    # This ensures the group has at least one good thinking example
 
-    group_ig_range_sufficient = np.ones(batch_size, dtype=bool)  # Default: True
     group_max_ig_positive = np.ones(batch_size, dtype=bool)  # Default: True
 
     if group_ids is not None:
@@ -186,23 +185,13 @@ def compute_omnimath_curriculum_metrics(batch: DataProto, tokenizer) -> dict:
         # Compute statistics for each group
         group_ig_stats = {}
         for gid, ig_vals in group_ig_values.items():
-            ig_min = min(ig_vals)
             ig_max = max(ig_vals)
-            ig_range = ig_max - ig_min
 
             group_ig_stats[gid] = {
-                "min": ig_min,
-                "max": ig_max,
-                "range": ig_range,
-                "range_sufficient": ig_range >= 100.0,  # Require range >= 100
                 "max_positive": ig_max > 0.0,  # Require at least one positive IG
             }
 
-        # Create per-sample arrays indicating if their group meets IG variance criteria
-        group_ig_range_sufficient = np.array([
-            group_ig_stats[group_ids[i]]["range_sufficient"] for i in range(batch_size)
-        ], dtype=bool)
-
+        # Create per-sample array indicating if their group has positive IG
         group_max_ig_positive = np.array([
             group_ig_stats[group_ids[i]]["max_positive"] for i in range(batch_size)
         ], dtype=bool)
@@ -215,6 +204,5 @@ def compute_omnimath_curriculum_metrics(batch: DataProto, tokenizer) -> dict:
         "partial_solution_given": np.array(partial_solutions, dtype=object),
         "remaining_solution": np.array(remaining_solutions, dtype=object),
         "group_all_formats_passed": group_all_formats_passed,  # Group-level format gating
-        "group_ig_range_sufficient": group_ig_range_sufficient,  # NEW: Group has IG range >= 100
-        "group_max_ig_positive": group_max_ig_positive,  # NEW: Group has at least one IG > 0
+        "group_max_ig_positive": group_max_ig_positive,  # Group has at least one IG > 0
     }

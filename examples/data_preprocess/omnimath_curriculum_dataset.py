@@ -153,19 +153,11 @@ def create_curriculum_prompt(problem: str, given_solution: str) -> str:
 
     # Create the simplified prompt without <think> tag (model must generate it)
     prompt = (
-        "You are reading a mathematical document that contains problems and fully worked solutions.\n\n"
-        "The text under ### Context is the beginning of one such solution, possibly cut off mid-argument.\n"
-        "Your task is to continue this solution so that the argument is completed in a way that is "
-        "mathematically correct and stylistically consistent with the context.\n\n"
-        "First, reason step by step between <think> and </think>. In <think>, you should:\n"
-        "- Understand what has already been proved in the Context.\n"
-        "- Figure out what the author is trying to do next.\n"
-        "- Plan how to continue from the last line to reach a clean conclusion.\n\n"
-        "After </think>, write only the predicted continuation of the document, starting "
-        "exactly from where the Context stops. Do NOT restate the problem and do NOT "
-        "summarize the context; just continue the solution in the same style.\n\n"
-        "Enclose this predicted continuation between <|startofprediction|> and <|endofprediction|>.\n\n"
-        f"### Context\n{context}\n\n"
+        "Complete the text provided under ### Context by continuing the mathematical solution from exactly where it stops. "
+        "Continue in the same style and level of formality as the context.\n\n"
+        "Think carefully about the best way to continue. Then write the continuation of the solution and enclose it within <|startofprediction|> and <|endofprediction|> tags. "
+        "Do not restate the problem or summarize the context within this continuation.\n\n"
+        f"### Context\n{context}\n"
     )
 
     return prompt

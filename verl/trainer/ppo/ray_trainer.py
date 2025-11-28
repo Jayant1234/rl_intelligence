@@ -624,24 +624,19 @@ class RayPPOTrainer:
         """
         import re
 
-        # Find </think> tag (case-sensitive)
-        # NOTE: We DON'T look for <think> since it's in the prompt
-        think_close_match = re.search(r'</think>', response_text)
-
         # Find <|startofprediction|> and <|endofprediction|> tags (case-sensitive)
         prediction_open_match = re.search(r'<\|startofprediction\|>', response_text)
         prediction_close_match = re.search(r'<\|endofprediction\|>', response_text)
 
-        # Extract thinking content from start of response to </think>
-        if think_close_match:
-            think_start = 0  # Response starts with thinking content
-            think_end = think_close_match.start()
-            thinking_text = response_text[think_start:think_end].strip()
+        # Extract thinking content from start of response to <|startofprediction|>
+        # Everything before the prediction tag is considered "thinking"
+        if prediction_open_match:
+            thinking_text = response_text[:prediction_open_match.start()].strip()
         else:
-            # No valid closing tag found - treat entire response as thinking
+            # No prediction tag found - treat entire response as thinking
             thinking_text = response_text.strip()
 
-        # Extract prediction content if tags exist
+        # Extract prediction content if both tags exist
         if prediction_open_match and prediction_close_match:
             prediction_start = prediction_open_match.end()
             prediction_end = prediction_close_match.start()
@@ -655,16 +650,19 @@ class RayPPOTrainer:
     def _construct_ig_batches_with_gold_solution(self, batch: DataProto) -> tuple[DataProto, DataProto]:
         """
         Construct two batches for Information Gain calculation:
-        1. Batch WITH thinking: Simplified doc continuation prompt + <think>thinking</think> + <|startofprediction|>gold_solution<|endofprediction|>
+        1. Batch WITH thinking: Simplified doc continuation prompt + thinking + <|startofprediction|>gold_solution<|endofprediction|>
         2. Batch WITHOUT thinking: Minimal baseline = "Solve the following math problem." + problem + partial_solution + gold_solution
 
         IG formula:
-        IG = log P(gold_solution | doc_format + thinking) - log P(gold_solution | minimal_baseline)
+        IG = mean log P(gold_solution | doc_format + thinking) - mean log P(gold_solution | minimal_baseline)
 
-        This measures: "Does our document continuation approach with thinking help compared to simple instruction?"
+        This measures: "Does our document continuation approach with thinking help compared to simple instruction (per token on average)?"
+        Using mean makes IG independent of gold solution length, important for curriculum learning with varying solution percentages.
 
-        NOTE: Baseline includes minimal instruction to follow DeepSeek/Qwen prompting best practices
-        (avoids artificially bad log probs from completely raw text).
+        NOTE:
+        - Thinking is everything before the <|startofprediction|> tag in the response
+        - Baseline includes minimal instruction to follow DeepSeek/Qwen prompting best practices
+          (avoids artificially bad log probs from completely raw text)
 
         Args:
             batch: Original batch with generated responses
@@ -714,20 +712,12 @@ class RayPPOTrainer:
 
             # ===== CONSTRUCT PROMPT WITH THINKING (Simplified Document Continuation Format) =====
             prompt_with_thinking = (
-                "You are reading a mathematical document that contains problems and fully worked solutions.\n\n"
-                "The text under ### Context is the beginning of one such solution, possibly cut off mid-argument.\n"
-                "Your task is to continue this solution so that the argument is completed in a way that is "
-                "mathematically correct and stylistically consistent with the context.\n\n"
-                "First, reason step by step between <think> and </think>. In <think>, you should:\n"
-                "- Understand what has already been proved in the Context.\n"
-                "- Figure out what the author is trying to do next.\n"
-                "- Plan how to continue from the last line to reach a clean conclusion.\n\n"
-                "After </think>, write only the predicted continuation of the document, starting "
-                "exactly from where the Context stops. Do NOT restate the problem and do NOT "
-                "summarize the context; just continue the solution in the same style.\n\n"
-                "Enclose this predicted continuation between <|startofprediction|> and <|endofprediction|>.\n\n"
+                "Complete the text provided under ### Context by continuing the mathematical solution from exactly where it stops. "
+                "Continue in the same style and level of formality as the context.\n\n"
+                "Think carefully about the best way to continue. Then write the continuation of the solution and enclose it within <|startofprediction|> and <|endofprediction|> tags. "
+                "Do not restate the problem or summarize the context within this continuation.\n\n"
                 f"### Context\n{context}\n\n"
-                f"<think>\n{thinking_text}\n</think>\n"
+                f"{thinking_text}\n"
                 f"<|startofprediction|>\n{gold_remaining_solution}\n<|endofprediction|>"
             )
 
@@ -1504,8 +1494,9 @@ class RayPPOTrainer:
                             batch = batch.union(ref_log_prob)
 
                     # ===== COMPUTE INFORMATION GAIN BASED ON REASONING QUALITY =====
-                    # New IG formula: IG = log P(gold_solution | prompt + reasoning) - log P(gold_solution | prompt)
-                    # This measures: "Does the model's reasoning help predict the CORRECT answer?"
+                    # IG formula: IG = mean log P(gold_solution | prompt + reasoning) - mean log P(gold_solution | prompt)
+                    # This measures: "Does the model's reasoning help predict the CORRECT answer (per token on average)?"
+                    # Using mean makes IG independent of gold solution length
                     if self.config.get("compute_information_gain", False):
                         with marked_timer("information_gain", timing_raw, color="purple"):
                             # Step 1: Construct two batches for IG calculation
@@ -1531,30 +1522,31 @@ class RayPPOTrainer:
                             responses_without = batch_without_reasoning.batch["responses"]  # [B, response_length]
                             response_masks_without = (responses_without != self.tokenizer.pad_token_id).float()  # [B, response_length]
 
-                            # Step 3: Sum log probs over gold solution tokens
-                            sum_with_reasoning = (log_probs_with * response_masks_with).sum(dim=1)  # [B]
-                            sum_without_reasoning = (log_probs_without * response_masks_without).sum(dim=1)  # [B]
+                            # Step 3: Average log probs over gold solution tokens (length-independent)
+                            mean_with_reasoning = (log_probs_with * response_masks_with).sum(dim=1) / (response_masks_with.sum(dim=1) + 1e-8)  # [B]
+                            mean_without_reasoning = (log_probs_without * response_masks_without).sum(dim=1) / (response_masks_without.sum(dim=1) + 1e-8)  # [B]
 
-                            # Step 4: Calculate Information Gain
-                            # IG = log P(gold | prompt + reasoning) - log P(gold | prompt)
-                            # Positive IG = reasoning helps predict correct answer
+                            # Step 4: Calculate Information Gain (per-token average)
+                            # IG = mean log P(gold | prompt + reasoning) - mean log P(gold | prompt)
+                            # Positive IG = reasoning helps predict correct answer (per token on average)
                             # Negative IG = reasoning hurts (confuses model)
-                            information_gain_raw = sum_with_reasoning - sum_without_reasoning  # [B]
+                            # Using mean makes IG independent of gold solution length
+                            information_gain_raw = mean_with_reasoning - mean_without_reasoning  # [B]
 
-                            # NORMALIZE INFORMATION GAIN to [-1, 1] range using batch statistics
+                            # NORMALIZE INFORMATION GAIN to [0, 1] range using batch statistics
                             # This prevents extremely large IG values from dominating the reward
                             ig_std = information_gain_raw.std() + 1e-8
                             ig_mean = information_gain_raw.mean()
 
-                            # Standardize: (IG - mean) / std, then apply tanh to map to [-1, 1]
-                            information_gain_normalized = torch.tanh((information_gain_raw - ig_mean) / (ig_std + 1e-8))
+                            # Standardize: (IG - mean) / std, then apply sigmoid to map to [0, 1]
+                            information_gain_normalized = torch.sigmoid((information_gain_raw - ig_mean) / (ig_std + 1e-8))
 
                             # Use normalized IG as the primary metric
-                            information_gain = information_gain_normalized  # [B], range: [-1, 1]
+                            information_gain = information_gain_normalized  # [B], range: [0, 1]
 
                             # Store both raw and normalized IG in batch for analysis
                             batch.batch["information_gain_raw"] = information_gain_raw  # [B], raw values
-                            batch.batch["information_gain"] = information_gain  # [B], normalized to [-1, 1]
+                            batch.batch["information_gain"] = information_gain  # [B], normalized to [0, 1]
 
                             # CRITICAL: Inject information gain into non_tensor_batch so reward function can access it
                             ig_numpy = information_gain.cpu().numpy()  # Normalized values
